@@ -1,12 +1,16 @@
 """Pytest configuration and shared fixtures.
 
-`temp_data_dir` redirects agent.storage's flat-file paths to a tmp_path so tests
-never touch the real data/ directory. Fixtures for U4 (mock_anthropic_briefing,
-mock_search_results, mock_fetch_html) will be added when those tests need them.
+- temp_data_dir: redirect storage flat-file paths to tmp_path (U3+)
+- make_text_block / make_tool_use_block / make_response: mock anthropic SDK shape
+- mock_llm_queue: queue-based mock for agent.llm.call_with_retry
 """
+
+import types
 
 import pytest
 
+
+# ---------- Storage isolation (U3) ----------
 
 @pytest.fixture
 def temp_data_dir(tmp_path, monkeypatch):
@@ -25,3 +29,40 @@ def temp_data_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "LOGS", logs)
     monkeypatch.setattr(storage, "ROOT", tmp_path)
     return tmp_path
+
+
+# ---------- Anthropic SDK shape mocks (U4) ----------
+
+def make_text_block(text: str):
+    """Mock an anthropic text block."""
+    return types.SimpleNamespace(type="text", text=text)
+
+
+def make_tool_use_block(tool_id: str, name: str, tool_input: dict):
+    """Mock an anthropic tool_use block."""
+    return types.SimpleNamespace(type="tool_use", id=tool_id, name=name, input=tool_input)
+
+
+def make_response(content_blocks: list):
+    """Mock an anthropic Message with the given content blocks."""
+    return types.SimpleNamespace(content=content_blocks, stop_reason="end_turn")
+
+
+@pytest.fixture
+def mock_llm_queue(mocker):
+    """Queue-based mock for agent.llm.call_with_retry.
+
+    Tests append response objects to the returned list; each call_with_retry
+    invocation pops the next response. Raises if queue exhausted.
+    """
+    queue: list = []
+
+    def fake_call(create_kwargs, max_retries=3):
+        if not queue:
+            raise RuntimeError(
+                "mock_llm_queue exhausted — test did not queue enough responses"
+            )
+        return queue.pop(0)
+
+    mocker.patch("agent.llm.call_with_retry", side_effect=fake_call)
+    return queue
