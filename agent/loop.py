@@ -143,13 +143,22 @@ def run(user_prompt: str) -> dict:
         # Reuse a successful summarize if the model called it before hitting cap/error.
         if last_summarize_briefing:
             briefing_text = last_summarize_briefing
+        elif llm_error:
+            # LLM is already broken — skip the fallback summarize call (it would
+            # just re-fail through the same retry budget and waste seconds).
+            briefing_text = (
+                f"# Briefing — {user_prompt}\n\n"
+                f"## TL;DR\n\nRun terminated with status `{status}`. "
+                f"LLM error: {llm_error}\n"
+            )
         else:
             # Last-resort: feed whatever we fetched into summarize directly.
+            # Filter to docs with real content — empty/error payloads pollute output.
             fetched_docs = []
             for call in tool_calls:
                 if call["name"] == "fetch":
                     cached = storage.load_fetched(call["input"].get("url", ""))
-                    if cached and cached.get("text"):
+                    if cached and cached.get("text") and not cached.get("error"):
                         fetched_docs.append(cached)
             try:
                 fallback = summarize.run(prompt=user_prompt, documents=fetched_docs)

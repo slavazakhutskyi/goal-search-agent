@@ -51,10 +51,14 @@ def slugify(text: str, max_len: int = 50) -> str:
 
 
 def save_briefing(prompt: str, markdown: str) -> Path:
-    """Persist briefing to data/briefings/{ts}-{slug}.md. Returns the Path."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    """Persist briefing to data/briefings/{ts}-{slug}.md. Returns the Path.
+
+    Timestamp includes microseconds (%f) so two runs of the same prompt within
+    one second don't silently overwrite each other.
+    """
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     path = BRIEFINGS / f"{ts}-{slugify(prompt)}.md"
-    path.write_text(markdown)
+    path.write_text(markdown, encoding="utf-8")
     return path
 
 

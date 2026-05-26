@@ -38,6 +38,7 @@ def call_with_retry(create_kwargs: dict, max_retries: int = 3):
         except (
             anthropic.RateLimitError,
             anthropic.APIConnectionError,
+            anthropic.APITimeoutError,
             anthropic.InternalServerError,
         ) as exc:
             last_exc = exc

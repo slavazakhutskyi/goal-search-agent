@@ -82,7 +82,8 @@ def test_fetch_cache_hit(mocker, temp_data_dir):
 
 
 def test_fetch_network_error(mocker, temp_data_dir):
-    """httpx raising → returned payload has error key, empty text, cached for later."""
+    """httpx raising → returned payload has error key + empty text. Error NOT cached
+    (transient errors must retry on subsequent calls — Round 2 reliability finding rel-001)."""
     _mock_httpx_response(mocker, raise_exc=httpx.ConnectError("dns failure"))
 
     out = fetch.run("https://nope.example.com/fail")
@@ -91,11 +92,16 @@ def test_fetch_network_error(mocker, temp_data_dir):
     assert out["text"] == ""
     assert out["char_count"] == 0
     assert out["metadata"]["source_domain"] == "nope.example.com"
-    # Second call hits the cache (no second httpx call)
-    httpx_get = mocker.patch("agent.tools.fetch.httpx.get")
+    # Crucially: error payload is NOT persisted to the cache.
+    assert storage.load_fetched("https://nope.example.com/fail") is None
+    # Second call retries httpx (no sticky cache from the first failure).
+    httpx_get_spy = mocker.patch(
+        "agent.tools.fetch.httpx.get", side_effect=httpx.ConnectError("dns failure"),
+    )
     out2 = fetch.run("https://nope.example.com/fail")
-    assert out2.get("_cache_hit") is True
-    httpx_get.assert_not_called()
+    assert "error" in out2
+    assert "_cache_hit" not in out2
+    httpx_get_spy.assert_called_once()
 
 
 def test_fetch_caps_long_content(mocker, temp_data_dir):

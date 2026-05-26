@@ -63,15 +63,15 @@ def run(url: str) -> dict:
         )
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        payload = {
+        # Do NOT cache errors — a transient 503 or timeout would poison the URL
+        # forever. Subsequent runs should retry on their own.
+        return {
             "url": url,
             "text": "",
             "metadata": _empty_metadata(url),
             "char_count": 0,
             "error": f"fetch failed: {exc!r}",
         }
-        storage.save_fetched(url, payload)
-        return payload
 
     html = response.text
     content_type = response.headers.get("content-type", "").split(";")[0].strip()
