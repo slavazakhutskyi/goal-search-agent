@@ -43,7 +43,7 @@ The briefing prints to stdout. A markdown copy is saved to `data/briefings/`, an
 pytest -v
 ```
 
-All 38 tests pass on a fresh checkout without API key or running Docker — the test suite mocks the Anthropic client and SearXNG.
+All 46 tests pass on a fresh checkout without API key or running Docker — the test suite mocks the Anthropic client and SearXNG.
 
 ---
 
@@ -142,7 +142,7 @@ The prompts in the spec are written in operator language ("briefing", "top 3 sto
 
 ### Behavior tests, not unit-coverage tests
 
-Per spec prompt: one schema-shape test asserting the briefing has TL;DR, key themes (≥1), sources (≥1), and sentiment in `{positive, neutral, negative}`. Plus per-tool smoke tests (happy + error paths) — 38 tests total. The tests run fully mocked: no API key required, no Docker required, `pytest` works on a fresh clone in seconds. Real-API validation happens manually when generating committed briefings (the artifacts in `data/briefings/`).
+Per spec prompt: one schema-shape test asserting the briefing has TL;DR, key themes (≥1), sources (≥1), and sentiment in `{positive, neutral, negative}`. Plus per-tool smoke tests (happy + error paths) and eval harness tests — 46 tests total. The tests run fully mocked: no API key required, no Docker required, `pytest` works on a fresh clone in seconds. Real-API validation happens manually when generating committed briefings (the artifacts in `data/briefings/`).
 
 ### Flat-file storage + `runs.jsonl` observability
 
@@ -193,27 +193,28 @@ For an operational intelligence tool, **partial signal beats no signal**. Silent
 
 ```mermaid
 flowchart TD
-    CLI["python -m agent &quot;&lt;prompt&gt;&quot;"] --> Loop[agent/loop.py<br/>tool-call loop · cap=12]
-    Loop -->|tool_use: search| Search[agent/tools/search.py]
-    Loop -->|tool_use: fetch| Fetch[agent/tools/fetch.py]
-    Loop -->|tool_use: summarize| Summarize[agent/tools/summarize.py]
-    Loop -->|every iteration| Anthropic[(Anthropic API<br/>Sonnet 4.6)]
+    CLI["python -m agent &quot;prompt&quot;"] --> Loop["agent/loop.py<br/>tool-call loop · cap=12"]
+    Loop -->|tool_use: search| Search["agent/tools/search.py"]
+    Loop -->|tool_use: fetch| Fetch["agent/tools/fetch.py"]
+    Loop -->|tool_use: summarize| Summarize["agent/tools/summarize.py"]
+    Loop -->|every iteration| Anthropic[("Anthropic API<br/>Sonnet 4.6")]
 
-    Search --> SearXNG[(SearXNG<br/>Docker :8888)]
-    Fetch --> WebPages[(Web pages<br/>via httpx + trafilatura)]
-    Fetch --> Cache[(data/fetched/<br/>URL-hash JSON cache)]
+    Search --> SearXNG[("SearXNG<br/>Docker :8888")]
+    Fetch --> WebPages[("Web pages<br/>via httpx + trafilatura")]
+    Fetch --> Cache[("data/fetched/<br/>URL-hash JSON cache")]
     Summarize --> Anthropic
 
-    Loop -->|status, iterations,<br/>tool calls, errors| RunsLog[(data/logs/runs.jsonl)]
-    Loop -->|final markdown| Briefing[(data/briefings/<br/>{ts}-{slug}.md)]
-    Loop --> Stdout[stdout: briefing<br/>stderr: status line]
+    Loop -->|run record| RunsLog[("data/logs/runs.jsonl<br/>machine-readable")]
+    Loop -->|narration| AgentLog[("data/logs/agent.log<br/>human-readable")]
+    Loop -->|markdown output| Briefing[("data/briefings/<br/>timestamped .md files")]
+    Loop --> Stdout["stdout: briefing<br/>stderr: status line"]
 
     classDef external fill:#e8f0fe,stroke:#4285f4,color:#000
     classDef storage fill:#fef7e0,stroke:#fbbc04,color:#000
     classDef code fill:#e6f4ea,stroke:#34a853,color:#000
     class CLI,Loop,Search,Fetch,Summarize code
     class Anthropic,SearXNG,WebPages external
-    class Cache,RunsLog,Briefing storage
+    class Cache,RunsLog,AgentLog,Briefing storage
 ```
 
 ### Why this shape
