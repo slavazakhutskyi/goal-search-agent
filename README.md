@@ -304,9 +304,18 @@ python -m eval data/briefings/
 
 ## Provenance
 
-This repo includes the brainstorm + plan documents that drove the build:
+This repo includes the workflow artifacts that drove the build — the brainstorm, the plan, and the learnings I captured along the way.
+
+**Brainstorm → Plan → Work pipeline:**
 
 - [`docs/brainstorms/2026-05-26-001-rapidsos-takehome-requirements.md`](docs/brainstorms/2026-05-26-001-rapidsos-takehome-requirements.md) — product requirements (problem framing, scope boundaries, key decisions D1–D9)
 - [`docs/plans/2026-05-26-001-feat-rapidsos-intel-agent-plan.md`](docs/plans/2026-05-26-001-feat-rapidsos-intel-agent-plan.md) — implementation plan with U1–U6 units and acceptance coverage matrix
 
-These show the brainstorm → plan → review → work pipeline this was built under. They're optional reading for evaluation — the artifact stands on its own.
+**Compounded learnings ([`docs/solutions/`](docs/solutions/))** — knowledge captured from this session so future agents/sessions inherit it. Four entries across architecture, security, workflow, and tooling:
+
+- [`architecture-patterns/tool-registry-module-refs-for-test-patchability.md`](docs/solutions/architecture-patterns/tool-registry-module-refs-for-test-patchability.md) — store module refs (not function refs) in `TOOL_REGISTRY` so `pytest-mock` patches intercept at dispatch time; uncovered by a real Round 1 test failure
+- [`security-issues/prompt-injection-in-fetched-content.md`](docs/solutions/security-issues/prompt-injection-in-fetched-content.md) — untrusted-data tagging pattern in summarize + judge prompts to mitigate injection from fetched web content
+- [`developer-experience/dont-pre-implement-before-brainstorm-and-plan.md`](docs/solutions/developer-experience/dont-pre-implement-before-brainstorm-and-plan.md) — ventriloquism warning: pre-authored implementation + defenses leave the operator unable to defend choices they never made
+- [`tooling-decisions/mixed-model-briefings-for-cost-bounded-takehome.md`](docs/solutions/tooling-decisions/mixed-model-briefings-for-cost-bounded-takehome.md) — Sonnet for the headline artifact, Haiku for the rest, transparent provenance via filename — the rationale behind the briefing-set composition above
+
+All workflow artifacts are optional reading for evaluation — the artifact stands on its own. They show how I work, not how I want the agent to be evaluated.
