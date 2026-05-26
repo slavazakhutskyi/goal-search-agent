@@ -12,7 +12,7 @@ import anthropic
 
 # Hardcoded per spec (D3 — single Sonnet, no provider abstraction).
 # Update here if Anthropic changes the canonical Sonnet ID.
-SONNET_MODEL = "claude-sonnet-4-5"
+SONNET_MODEL = "claude-sonnet-4-6"
 
 _client: anthropic.Anthropic | None = None
 

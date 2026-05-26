@@ -61,5 +61,21 @@ def save_briefing(prompt: str, markdown: str) -> Path:
 def log_run(entry: dict) -> None:
     """Append one JSON line to data/logs/runs.jsonl. Adds ISO timestamp."""
     entry = {"timestamp": datetime.now(timezone.utc).isoformat(), **entry}
-    with (LOGS / "runs.jsonl").open("a") as f:
+    with (LOGS / "runs.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def log_event(level: str, message: str, **fields) -> None:
+    """Append one human-readable log line to data/logs/agent.log.
+
+    Companion to runs.jsonl — runs.jsonl is the machine-readable run record;
+    agent.log is the streaming narration ("what is the agent doing right now").
+    In production this would graduate to structured logging (Langfuse / OTel);
+    here it's a single function call to demonstrate the pattern without the
+    vendor footprint.
+    """
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    extras = " ".join(f"{k}={v}" for k, v in fields.items())
+    line = f"[{ts}] {level:>5} {message}" + (f"  {extras}" if extras else "")
+    with (LOGS / "agent.log").open("a", encoding="utf-8") as f:
+        f.write(line + "\n")

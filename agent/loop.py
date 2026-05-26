@@ -13,7 +13,10 @@ from types import ModuleType
 from agent import llm, prompts, storage
 from agent.tools import fetch, search, summarize
 
-MAX_ITERATIONS = 8  # 3 phases × 2-3 calls ceiling. Kill switch, not design target.
+MAX_ITERATIONS = 12  # Originally 8 from first-principles; observed prompt #1 (RapidSOS 7-day)
+                      # hit the cap with a still-valid briefing via the partial fallback. Raised
+                      # to 12 after the U5 iteration-cap measurement step (see plan U4 verification).
+                      # Kill switch, not design target.
 MAX_TOKENS = 2048
 
 
@@ -61,6 +64,10 @@ def run(user_prompt: str) -> dict:
     status = "incomplete"
     llm_error: str | None = None
     iteration = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    storage.log_event("INFO", "agent run start", prompt=repr(user_prompt)[:80], model=llm.SONNET_MODEL)
 
     for iteration in range(1, MAX_ITERATIONS + 1):
         try:
@@ -76,7 +83,13 @@ def run(user_prompt: str) -> dict:
             # Loud-log and break so we still write runs.jsonl + a partial briefing.
             llm_error = f"{type(exc).__name__}: {exc}"
             status = "partial_llm_error"
+            storage.log_event("ERROR", "LLM call failed", iteration=iteration, error=llm_error)
             break
+
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            total_input_tokens += getattr(usage, "input_tokens", 0)
+            total_output_tokens += getattr(usage, "output_tokens", 0)
 
         # Assistant content goes back into history for tool_result correlation.
         messages.append({"role": "assistant", "content": response.content})
@@ -102,15 +115,21 @@ def run(user_prompt: str) -> dict:
         # Execute every tool the model requested this turn.
         tool_result_blocks = []
         for tool_use in tool_uses:
+            tool_started = time.time()
             result = _dispatch_tool(tool_use.name, dict(tool_use.input))
+            tool_elapsed = round(time.time() - tool_started, 2)
             if tool_use.name == "summarize" and isinstance(result, dict) and result.get("briefing"):
                 last_summarize_briefing = result["briefing"]
+            err = result.get("error") if isinstance(result, dict) else None
             tool_calls.append({
                 "iteration": iteration,
                 "name": tool_use.name,
                 "input": dict(tool_use.input),
-                "error": result.get("error") if isinstance(result, dict) else None,
+                "elapsed_seconds": tool_elapsed,
+                "error": err,
             })
+            level = "WARN" if err else "INFO"
+            storage.log_event(level, f"tool {tool_use.name}", iteration=iteration, elapsed=tool_elapsed, error=err or "")
             tool_result_blocks.append(_tool_result_block(tool_use.id, result))
 
         messages.append({"role": "user", "content": tool_result_blocks})
@@ -148,8 +167,17 @@ def run(user_prompt: str) -> dict:
         "status": status,
         "iterations": iteration,
         "elapsed_seconds": round(elapsed, 2),
+        "tokens": {
+            "input": total_input_tokens,
+            "output": total_output_tokens,
+        },
         "tool_calls": [
-            {"iteration": c["iteration"], "name": c["name"], "error": c["error"]}
+            {
+                "iteration": c["iteration"],
+                "name": c["name"],
+                "elapsed_seconds": c.get("elapsed_seconds", 0),
+                "error": c["error"],
+            }
             for c in tool_calls
         ],
         "briefing_path": str(briefing_path.relative_to(storage.ROOT)) if briefing_path else None,
@@ -157,6 +185,12 @@ def run(user_prompt: str) -> dict:
     if llm_error:
         log_entry["llm_error"] = llm_error
     storage.log_run(log_entry)
+    storage.log_event(
+        "INFO", f"agent run end status={status}",
+        iterations=iteration, elapsed=round(elapsed, 2),
+        tokens_in=total_input_tokens, tokens_out=total_output_tokens,
+        tools=len(tool_calls),
+    )
 
     return {
         "briefing": briefing_text,
@@ -165,4 +199,5 @@ def run(user_prompt: str) -> dict:
         "iterations": iteration,
         "elapsed_seconds": round(elapsed, 2),
         "tool_call_count": len(tool_calls),
+        "tokens": {"input": total_input_tokens, "output": total_output_tokens},
     }
