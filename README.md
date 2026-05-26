@@ -99,14 +99,24 @@ during disaster response, state-level procurement pathways opening...
 [full briefing in data/briefings/]
 ```
 
-**Note on the committed briefings.** `data/briefings/` contains three real runs:
-the 7-day RapidSOS prompt above (Sonnet 4.6), plus two Haiku-generated briefings
-(competitors, RapidSOS 7d v1) kept from cost-bounded smoke-test runs. The default
-deployed model is Sonnet (`agent/llm.py:SONNET_MODEL`); the Haiku briefings are
-preserved as honest artifacts demonstrating the loop runs cleanly on a cheaper model
-when budget matters. Two of the four spec prompts (top-3-stories, sentiment) were
-generated during smoke-test and not re-run on Sonnet — they're covered by the
-behavior tests in `tests/test_acceptance.py` and trivially re-runnable.
+**Note on the committed briefings.** `data/briefings/` contains five real runs against
+all four spec prompts, with the model identified in each filename:
+
+- `20260526-143055-sonnet-...md` — prompt #1 (RapidSOS 7-day), Sonnet 4.6. **The headline artifact,
+  inlined above.**
+- `20260526-141052-haiku-...md` — prompt #1 (RapidSOS 7-day), Haiku 4.5. Earlier smoke-test
+  run kept as a side-by-side artifact showing the same loop runs cleanly on a cheaper model.
+- `20260526-141619-haiku-...md` — prompt #3 (competitors), Haiku. AE2 parent-company
+  surfacing visible inline ("Carbyne (Axon)", "RapidDeploy (Motorola)", "Prepared (Axon)").
+- `20260526-162750-haiku-...md` — prompt #2 (top-3 stories), Haiku.
+- `20260526-163004-haiku-...md` — prompt #4 (sentiment), Haiku.
+
+The default deployed model is Sonnet (`agent/llm.py:SONNET_MODEL`). The mixed-model set
+exists for two reasons: (1) honest cost-discipline — a single take-home budget shouldn't
+burn the whole API balance to demonstrate that the loop works on every prompt; (2) it
+incidentally demonstrates the agent produces structurally-valid briefings on either model.
+The deterministic eval in `eval/checks.py` confirms all 5 pass schema (`python -m eval
+--no-judge data/briefings/`).
 
 <!-- INLINE_EXAMPLE_BRIEFING_END -->
 
