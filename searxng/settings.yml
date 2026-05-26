@@ -1,0 +1,38 @@
+use_default_settings: true
+
+general:
+  instance_name: "rapidsos-intel"
+  donation_url: false
+  contact_url: false
+
+server:
+  # Generated locally with `openssl rand -hex 32`.
+  # For a public take-home this value is fine to commit — SearXNG runs locally and
+  # the instance is not exposed; rotate before any non-local deployment.
+  secret_key: "9b542a00296e44dcceda7f9b7b55a2468d9a3b8cd8aa683c09d9cdbf02662ca6"
+  limiter: false        # avoid Redis/Valkey sidecar dependency for take-home scope
+  image_proxy: false
+  http_protocol_version: "1.1"
+  bind_address: "0.0.0.0"
+  port: 8080
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:              # json must be opt-in; default is html only
+    - html
+    - json
+
+ui:
+  static_use_hash: true
+  default_locale: "en"
+
+engines:
+  - name: google
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: brave
+    disabled: false

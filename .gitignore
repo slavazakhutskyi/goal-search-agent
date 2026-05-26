@@ -1,0 +1,31 @@
+# OS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+
+# Claude Code local
+.claude/settings.local.json
+
+# Interview prep — not for the public repo
+docs/_prep/
+docs/context/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Secrets
+.env
+
+# Local runtime artifacts (briefings ARE tracked)
+data/fetched/
+data/logs/
+
+# SearXNG runtime files
+searxng/uwsgi.ini
