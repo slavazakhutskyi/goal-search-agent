@@ -10,9 +10,9 @@ import time
 
 import anthropic
 
-# Model resolved at import time. Override via ANTHROPIC_MODEL env var.
-# Default targets the current Sonnet; verify against Anthropic's model list if it changes.
-SONNET_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+# Hardcoded per spec (D3 — single Sonnet, no provider abstraction).
+# Update here if Anthropic changes the canonical Sonnet ID.
+SONNET_MODEL = "claude-sonnet-4-5"
 
 _client: anthropic.Anthropic | None = None
 

@@ -56,48 +56,59 @@ def run(user_prompt: str) -> dict:
     messages: list[dict] = [{"role": "user", "content": user_prompt}]
 
     tool_calls: list[dict] = []
+    last_summarize_briefing: str | None = None  # set after every successful summarize dispatch
     briefing_text = ""
     status = "incomplete"
+    llm_error: str | None = None
     iteration = 0
 
     for iteration in range(1, MAX_ITERATIONS + 1):
-        response = llm.call_with_retry({
-            "model": llm.SONNET_MODEL,
-            "max_tokens": MAX_TOKENS,
-            "tools": tools,
-            "system": prompts.SYSTEM_PROMPT,
-            "messages": messages,
-        })
+        try:
+            response = llm.call_with_retry({
+                "model": llm.SONNET_MODEL,
+                "max_tokens": MAX_TOKENS,
+                "tools": tools,
+                "system": prompts.SYSTEM_PROMPT,
+                "messages": messages,
+            })
+        except Exception as exc:
+            # Non-retryable LLM error (auth, bad request, schema, network exhausted).
+            # Loud-log and break so we still write runs.jsonl + a partial briefing.
+            llm_error = f"{type(exc).__name__}: {exc}"
+            status = "partial_llm_error"
+            break
 
-        # The assistant's full content block must go back into history for the
-        # next tool_result turn to correlate with tool_use_ids.
+        # Assistant content goes back into history for tool_result correlation.
         messages.append({"role": "assistant", "content": response.content})
 
         tool_uses = [b for b in response.content if b.type == "tool_use"]
         text_blocks = [b.text for b in response.content if b.type == "text"]
 
         if not tool_uses:
-            # Model produced a final text. Prefer the most recent summarize result;
-            # fall back to the model's text if it summarized inline.
-            for call in reversed(tool_calls):
-                if call["name"] == "summarize" and call.get("result", {}).get("briefing"):
-                    briefing_text = call["result"]["briefing"]
-                    break
-            if not briefing_text:
+            # Final text turn. Prefer the most recent successful summarize result;
+            # fall back to the model's inline text if no summarize ever ran.
+            if last_summarize_briefing:
+                briefing_text = last_summarize_briefing
+            elif text_blocks:
                 briefing_text = "\n".join(text_blocks).strip()
-            status = "complete"
+            # If both empty, we leave briefing_text="" and fall into the partial branch
+            # rather than persisting an empty briefing as "complete".
+            if briefing_text:
+                status = "complete"
+                break
+            status = "partial_empty_response"
             break
 
         # Execute every tool the model requested this turn.
         tool_result_blocks = []
         for tool_use in tool_uses:
             result = _dispatch_tool(tool_use.name, dict(tool_use.input))
+            if tool_use.name == "summarize" and isinstance(result, dict) and result.get("briefing"):
+                last_summarize_briefing = result["briefing"]
             tool_calls.append({
                 "iteration": iteration,
                 "name": tool_use.name,
                 "input": dict(tool_use.input),
-                # Keep summarize result for briefing extraction; others stay light.
-                "result": result if tool_use.name == "summarize" else None,
                 "error": result.get("error") if isinstance(result, dict) else None,
             })
             tool_result_blocks.append(_tool_result_block(tool_use.id, result))
@@ -106,9 +117,14 @@ def run(user_prompt: str) -> dict:
 
     elapsed = time.time() - started
 
-    if status != "complete":
+    if status == "incomplete":
         status = "partial_max_iterations"
-        if not briefing_text:
+
+    if not briefing_text:
+        # Reuse a successful summarize if the model called it before hitting cap/error.
+        if last_summarize_briefing:
+            briefing_text = last_summarize_briefing
+        else:
             # Last-resort: feed whatever we fetched into summarize directly.
             fetched_docs = []
             for call in tool_calls:
@@ -116,21 +132,31 @@ def run(user_prompt: str) -> dict:
                     cached = storage.load_fetched(call["input"].get("url", ""))
                     if cached and cached.get("text"):
                         fetched_docs.append(cached)
-            fallback = summarize.run(prompt=user_prompt, documents=fetched_docs)
-            briefing_text = fallback.get("briefing", "")
+            try:
+                fallback = summarize.run(prompt=user_prompt, documents=fetched_docs)
+                briefing_text = fallback.get("briefing", "")
+            except Exception as exc:
+                briefing_text = (
+                    f"# Briefing — {user_prompt}\n\n"
+                    f"## TL;DR\n\nRun terminated with status `{status}`. "
+                    f"Fallback summarize also failed: {type(exc).__name__}: {exc}\n"
+                )
 
     briefing_path = storage.save_briefing(user_prompt, briefing_text)
-    storage.log_run({
+    log_entry = {
         "prompt": user_prompt,
         "status": status,
         "iterations": iteration,
         "elapsed_seconds": round(elapsed, 2),
         "tool_calls": [
-            {"i": c["iteration"], "name": c["name"], "error": c["error"]}
+            {"iteration": c["iteration"], "name": c["name"], "error": c["error"]}
             for c in tool_calls
         ],
         "briefing_path": str(briefing_path.relative_to(storage.ROOT)) if briefing_path else None,
-    })
+    }
+    if llm_error:
+        log_entry["llm_error"] = llm_error
+    storage.log_run(log_entry)
 
     return {
         "briefing": briefing_text,

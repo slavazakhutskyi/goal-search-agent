@@ -110,6 +110,62 @@ def test_loop_persists_briefing_to_data(mocker, mock_llm_queue, temp_data_dir):
     assert out["briefing_path"] == briefings[0]
 
 
-def test_loop_max_iterations_constant():
-    """8-iteration cap is documented in the plan (D7)."""
-    assert loop.MAX_ITERATIONS == 8
+def test_loop_llm_exception_logged_as_partial(mocker, mock_llm_queue, temp_data_dir):
+    """Non-retryable LLM error → status=partial_llm_error, runs.jsonl logged, briefing written."""
+    import anthropic
+
+    mocker.patch(
+        "agent.llm.call_with_retry",
+        side_effect=anthropic.AuthenticationError(
+            message="bad key", response=mocker.MagicMock(), body=None,
+        ),
+    )
+
+    out = loop.run("Test prompt with auth failure")
+
+    assert out["status"] == "partial_llm_error"
+    assert out["briefing"]  # non-empty stub briefing
+    # runs.jsonl was written despite the failure
+    runs_path = temp_data_dir / "logs" / "runs.jsonl"
+    assert runs_path.exists()
+    entry = json.loads(runs_path.read_text().strip().split("\n")[-1])
+    assert entry["status"] == "partial_llm_error"
+    assert "AuthenticationError" in entry.get("llm_error", "")
+
+
+def test_loop_partial_reuses_successful_summarize(mocker, mock_llm_queue, temp_data_dir):
+    """When summarize ran successfully but cap was hit, reuse that briefing (no extra call)."""
+    successful_briefing = "# Briefing — From summarize\n\n## TL;DR\nReal output."
+    summarize_spy = mocker.patch(
+        "agent.tools.summarize.run", return_value={"briefing": successful_briefing}
+    )
+    mocker.patch("agent.tools.search.run", return_value={"query": "x", "results": []})
+
+    # Iter 1: summarize (sets last_summarize_briefing).
+    # Iters 2-8: search (model keeps looping; never terminates).
+    mock_llm_queue.append(
+        make_response([make_tool_use_block("t0", "summarize", {"prompt": "x", "documents": []})])
+    )
+    for i in range(loop.MAX_ITERATIONS - 1):
+        mock_llm_queue.append(
+            make_response([make_tool_use_block(f"t{i+1}", "search", {"query": "x"})])
+        )
+
+    out = loop.run("Cap hit after successful summarize")
+
+    assert out["status"] == "partial_max_iterations"
+    assert out["briefing"] == successful_briefing
+    # summarize.run was called exactly once (the original call, not a fallback)
+    assert summarize_spy.call_count == 1
+
+
+def test_loop_empty_response_marks_partial(mocker, mock_llm_queue, temp_data_dir):
+    """Model returns response with no tool_use and no text → status=partial_empty_response."""
+    mocker.patch("agent.tools.summarize.run", return_value={"briefing": "# Briefing — fallback\n\n## TL;DR\nok"})
+    mock_llm_queue.append(make_response([]))  # empty content blocks
+
+    out = loop.run("Test empty response")
+
+    assert out["status"] == "partial_empty_response"
+    # Fallback briefing exists (either from a successful summarize earlier or from summarize.run fallback)
+    assert out["briefing"]

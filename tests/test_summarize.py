@@ -38,10 +38,12 @@ def test_summarize_empty_documents(mock_llm_queue):
     assert mock_llm_queue == []
 
 
-def test_summarize_formats_documents_with_labels(mocker, mock_llm_queue):
+def test_summarize_formats_documents_with_labels(mocker):
     """Two docs → user message sent to LLM contains [Document 1] and [Document 2] labels."""
-    mock_llm_queue.append(make_response([make_text_block("# Briefing — Test\n\n## TL;DR\nok")]))
-    spy = mocker.patch("agent.llm.call_with_retry", wraps=lambda kw, max_retries=3: make_response([make_text_block("# Briefing — Test\n\n## TL;DR\nok")]))
+    spy = mocker.patch(
+        "agent.llm.call_with_retry",
+        return_value=make_response([make_text_block("# Briefing — Test\n\n## TL;DR\nok")]),
+    )
 
     summarize.run(
         prompt="X",
@@ -51,7 +53,6 @@ def test_summarize_formats_documents_with_labels(mocker, mock_llm_queue):
         ],
     )
 
-    # spy captured the create_kwargs as the first positional arg
     create_kwargs = spy.call_args.args[0]
     user_msg = create_kwargs["messages"][0]["content"]
     assert "[Document 1]" in user_msg
