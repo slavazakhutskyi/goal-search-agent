@@ -43,6 +43,27 @@ def _dispatch_tool(name: str, tool_input: dict) -> dict:
         return {"error": f"{name} raised: {exc!r}"}
 
 
+def _collect_fetched_docs(tool_calls: list[dict]) -> list[dict]:
+    """Read cached docs for every successful fetch in the current run.
+
+    Auto-attach helper for the summarize-without-documents path (U0 from
+    docs/plans/2026-05-27-002...). Mirrors the existing fallback pattern at
+    the bottom of `run()` so both paths use the same definition of
+    "successfully fetched" — has text, no error.
+    """
+    docs: list[dict] = []
+    for call in tool_calls:
+        if call.get("name") != "fetch":
+            continue
+        url = (call.get("input") or {}).get("url", "")
+        if not url:
+            continue
+        cached = storage.load_fetched(url)
+        if cached and cached.get("text") and not cached.get("error"):
+            docs.append(cached)
+    return docs
+
+
 def _tool_result_block(tool_use_id: str, content: dict) -> dict:
     """Serialize tool output for the next assistant turn."""
     return {
@@ -126,15 +147,28 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
         tool_result_blocks = []
         for tool_use in tool_uses:
             tool_started = time.time()
-            result = _dispatch_tool(tool_use.name, dict(tool_use.input))
+            tool_input = dict(tool_use.input)
+            # U0 auto-attach: if the model called summarize without documents,
+            # inject all successfully-fetched docs from this run before dispatch.
+            # Eliminates the summarize_missing_documents failure pattern that
+            # fired in 6 of 7 historical runs.
+            if tool_use.name == "summarize" and "documents" not in tool_input:
+                tool_input["documents"] = _collect_fetched_docs(tool_calls)
+            result = _dispatch_tool(tool_use.name, tool_input)
             tool_elapsed = round(time.time() - tool_started, 2)
             if tool_use.name == "summarize" and isinstance(result, dict) and result.get("briefing"):
                 last_summarize_briefing = result["briefing"]
             err = result.get("error") if isinstance(result, dict) else None
+            # Record the as-dispatched input (post auto-attach). For summarize
+            # auto-attach we collapse the docs to a count so the log stays
+            # compact and the URL list isn't duplicated from fetch records.
+            recorded_input = dict(tool_use.input)
+            if tool_use.name == "summarize" and "documents" not in tool_use.input and "documents" in tool_input:
+                recorded_input["_auto_attached_docs"] = len(tool_input["documents"])
             tool_calls.append({
                 "iteration": iteration,
                 "name": tool_use.name,
-                "input": dict(tool_use.input),
+                "input": recorded_input,
                 "elapsed_seconds": tool_elapsed,
                 "error": err,
             })

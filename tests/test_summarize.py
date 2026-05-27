@@ -65,4 +65,13 @@ def test_summarize_formats_documents_with_labels(mocker):
 def test_summarize_tool_schema_is_anthropic_shape():
     schema = summarize.TOOL_SCHEMA
     assert schema["name"] == "summarize"
-    assert set(schema["input_schema"]["required"]) == {"prompt", "documents"}
+    # U0: documents is OPTIONAL — the loop auto-attaches fetched docs when omitted
+    assert set(schema["input_schema"]["required"]) == {"prompt"}
+    assert "documents" in schema["input_schema"]["properties"]
+
+
+def test_summarize_run_documents_default_none():
+    """U0: summarize.run accepts no documents arg, returns empty-docs stub."""
+    result = summarize.run(prompt="test prompt")
+    assert "briefing" in result
+    assert "No sources retrieved" in result["briefing"]

@@ -35,6 +35,94 @@ def test_loop_natural_termination(mocker, mock_llm_queue, temp_data_dir):
     assert out["briefing"] == CANNED_BRIEFING
 
 
+def test_loop_auto_attaches_documents_when_summarize_omits_them(
+    mocker, mock_llm_queue, temp_data_dir
+):
+    """U0: model calls summarize(prompt=...) WITHOUT documents → loop injects fetched docs.
+
+    This is the auto-attach path that eliminates the summarize_missing_documents
+    failure pattern that fired in 6 of 7 historical runs.
+    """
+    from agent import storage
+
+    # Seed cache with two successfully-fetched docs
+    storage.save_fetched("https://a.example", {
+        "url": "https://a.example", "text": "content a",
+        "metadata": {"title": "A", "source_domain": "a.example"},
+    })
+    storage.save_fetched("https://b.example", {
+        "url": "https://b.example", "text": "content b",
+        "metadata": {"title": "B", "source_domain": "b.example"},
+    })
+
+    # Spy on summarize.run to inspect what documents arg arrives
+    summarize_spy = mocker.patch(
+        "agent.tools.summarize.run", return_value={"briefing": CANNED_BRIEFING}
+    )
+    # fetch.run hits the cache (existing behavior)
+    mocker.patch(
+        "agent.tools.fetch.run",
+        side_effect=lambda url: storage.load_fetched(url) or {"error": "miss"},
+    )
+
+    mock_llm_queue.extend([
+        make_response([
+            make_tool_use_block("t1", "fetch", {"url": "https://a.example"}),
+            make_tool_use_block("t2", "fetch", {"url": "https://b.example"}),
+        ]),
+        # Model calls summarize WITHOUT documents — the failure mode U0 fixes
+        make_response([make_tool_use_block("t3", "summarize", {"prompt": "test"})]),
+        make_response([make_text_block("Done.")]),
+    ])
+
+    out = loop.run("Test prompt")
+
+    assert out["status"] == "complete"
+    # The summarize call should have received the auto-attached documents
+    call_args = summarize_spy.call_args
+    docs = call_args.kwargs.get("documents") or (call_args.args[1] if len(call_args.args) > 1 else None)
+    assert docs is not None and len(docs) == 2
+    urls = {d["url"] for d in docs}
+    assert urls == {"https://a.example", "https://b.example"}
+
+
+def test_loop_does_not_auto_attach_when_model_passes_documents(
+    mocker, mock_llm_queue, temp_data_dir
+):
+    """U0: if the model passes documents explicitly, the loop does NOT override."""
+    from agent import storage
+
+    storage.save_fetched("https://cached.example", {
+        "url": "https://cached.example", "text": "cached",
+        "metadata": {"title": "C", "source_domain": "cached.example"},
+    })
+
+    summarize_spy = mocker.patch(
+        "agent.tools.summarize.run", return_value={"briefing": CANNED_BRIEFING}
+    )
+    mocker.patch(
+        "agent.tools.fetch.run",
+        side_effect=lambda url: storage.load_fetched(url) or {"error": "miss"},
+    )
+
+    explicit_docs = [{"url": "https://explicit.example", "text": "explicit"}]
+
+    mock_llm_queue.extend([
+        make_response([make_tool_use_block("t1", "fetch", {"url": "https://cached.example"})]),
+        make_response([make_tool_use_block(
+            "t2", "summarize", {"prompt": "test", "documents": explicit_docs}
+        )]),
+        make_response([make_text_block("Done.")]),
+    ])
+
+    loop.run("Test prompt")
+
+    call_args = summarize_spy.call_args
+    docs = call_args.kwargs.get("documents") or (call_args.args[1] if len(call_args.args) > 1 else None)
+    # The model's explicit docs should win — NOT the loop's auto-attach
+    assert docs == explicit_docs
+
+
 def test_loop_max_iterations_partial(mocker, mock_llm_queue, temp_data_dir):
     """Model never terminates → status partial, fallback summarize runs."""
     mocker.patch("agent.tools.search.run", return_value={"query": "x", "results": []})
