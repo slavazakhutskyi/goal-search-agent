@@ -355,31 +355,43 @@ def test_keep_last_edit_marks_kept_true(temp_data_dir, mocker):
     assert history[-1]["note"] == "looks good"
 
 
-# ---------- U7: classify_canary (pure deterministic logic) ----------
+# ---------- U7: classify_canary (composite verdict — U5 contract) ----------
 
-def test_classify_canary_promote_on_all_improved():
-    decision, _ = meta_eval.classify_canary({"type": "add"}, [{"delta": 1}, {"delta": 2}])
+def test_classify_canary_promote_on_avg_above_threshold():
+    """U5: avg composite_delta > PROMOTE_DELTA (0.05) → promote."""
+    decision, _ = meta_eval.classify_canary({"type": "add"}, [
+        {"composite_delta": 0.08}, {"composite_delta": 0.10}
+    ])
     assert decision == "promote"
 
 
 def test_classify_canary_discard_on_severe_regression():
-    decision, _ = meta_eval.classify_canary({"type": "replace"}, [{"delta": 1}, {"delta": -2}])
+    """U5: any single composite_delta < DISCARD_DELTA (-0.10) → discard."""
+    decision, _ = meta_eval.classify_canary({"type": "replace"}, [
+        {"composite_delta": 0.05}, {"composite_delta": -0.20}
+    ])
     assert decision == "discard"
 
 
-def test_classify_canary_gate_on_mixed_signal():
-    decision, _ = meta_eval.classify_canary({"type": "add"}, [{"delta": 1}, {"delta": -1}])
+def test_classify_canary_gate_on_noise_band():
+    """U5: avg within (-0.10, +0.05] without severe regression → gate."""
+    decision, _ = meta_eval.classify_canary({"type": "add"}, [
+        {"composite_delta": 0.03}, {"composite_delta": -0.02}
+    ])
     assert decision == "gate"
 
 
 def test_classify_canary_gate_on_flat():
-    # All zero → no strict improvement → gate
-    decision, _ = meta_eval.classify_canary({"type": "add"}, [{"delta": 0}, {"delta": 0}])
+    decision, _ = meta_eval.classify_canary({"type": "add"}, [
+        {"composite_delta": 0.0}, {"composite_delta": 0.0}
+    ])
     assert decision == "gate"
 
 
 def test_classify_canary_always_discards_delete():
-    decision, reason = meta_eval.classify_canary({"type": "delete"}, [{"delta": 2}])
+    decision, reason = meta_eval.classify_canary({"type": "delete"}, [
+        {"composite_delta": 0.20}
+    ])
     assert decision == "discard"
     assert "blast radius" in reason
 

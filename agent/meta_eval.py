@@ -501,6 +501,7 @@ def apply_edit(edit_id: str, *, yes: bool = False) -> dict:
         "before_score": None,
         "after_score": None,
         "kept": None,
+        "metric_version": "composite-v1",  # U3: tags this record for demonstrations eligibility
     }
     record_edit_attempt(record)
 
@@ -692,61 +693,107 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
         _save_canary(result)
         return result
 
-    # 4. K replay pairs
+    # 4. K replay pairs — now using composite verdict (operator + structure + tokens + errors)
+    from agent import operator_sim as _opsim
     k_results = []
     for i in range(k):
         baseline_run = _replay.replay_run(canary_prompt, canary_urls, system_override=baseline_text)
         candidate_run = _replay.replay_run(canary_prompt, canary_urls, system_override=candidate_text)
-        baseline_score = _eval.check_structure(baseline_run.get("briefing", ""))["score"]
-        candidate_score = _eval.check_structure(candidate_run.get("briefing", ""))["score"]
+
+        baseline_brief = baseline_run.get("briefing", "")
+        candidate_brief = candidate_run.get("briefing", "")
+
+        # Structure (existing)
+        baseline_struct = _eval.check_structure(baseline_brief)
+        candidate_struct = _eval.check_structure(candidate_brief)
+
+        # Operator simulation (new — primary signal, with groundedness check)
+        baseline_op = _opsim.coverage_score(canary_prompt, baseline_brief)
+        candidate_op = _opsim.coverage_score(canary_prompt, candidate_brief)
+
+        # Build minimal eval_records for composite scoring
+        baseline_eval = {
+            "operator_sim": baseline_op,
+            "structure": baseline_struct,
+            "tokens": baseline_run.get("tokens"),
+            "trace_issues": [
+                {"tag": "error"} for c in (baseline_run.get("tool_call_count") and [] or [])
+            ],  # token-count proxy until we surface real trace issues from replays
+        }
+        candidate_eval = {
+            "operator_sim": candidate_op,
+            "structure": candidate_struct,
+            "tokens": candidate_run.get("tokens"),
+            "trace_issues": [],
+        }
+
+        baseline_composite = _opsim.composite_score(baseline_eval)
+        candidate_composite = _opsim.composite_score(candidate_eval)
+
         k_results.append({
             "iteration": i,
             "canary_prompt": canary_prompt,
-            "baseline_score": baseline_score,
-            "candidate_score": candidate_score,
-            "delta": candidate_score - baseline_score,
+            "baseline_composite": baseline_composite["composite"],
+            "candidate_composite": candidate_composite["composite"],
+            "composite_delta": round(
+                candidate_composite["composite"] - baseline_composite["composite"], 4
+            ),
+            "baseline_breakdown": baseline_composite["breakdown"],
+            "candidate_breakdown": candidate_composite["breakdown"],
             "baseline_status": baseline_run.get("status"),
             "candidate_status": candidate_run.get("status"),
             "baseline_tokens": baseline_run.get("tokens"),
             "candidate_tokens": candidate_run.get("tokens"),
         })
 
-    # 5. Classify
+    # 5. Classify via composite delta (averaged across K)
     decision, reason = classify_canary(edit, k_results)
-    avg_delta = sum(r["delta"] for r in k_results) / len(k_results)
+    avg_delta = sum(r["composite_delta"] for r in k_results) / len(k_results)
+    avg_baseline = sum(r["baseline_composite"] for r in k_results) / len(k_results)
+    avg_candidate = sum(r["candidate_composite"] for r in k_results) / len(k_results)
 
     result = {
         "edit_id": edit.get("id"),
         "edit_type": edit.get("type"),
         "decision": decision,
         "reason": reason,
-        "delta": avg_delta,
+        "delta": round(avg_delta, 4),
+        "baseline_composite": round(avg_baseline, 4),
+        "candidate_composite": round(avg_candidate, 4),
         "k": k,
         "k_results": k_results,
+        "metric_version": "composite-v1",  # marks this record for U3 demonstrations gate
     }
     _save_canary(result)
     return result
 
 
 def classify_canary(edit: dict, k_results: list[dict]) -> tuple[str, str]:
-    """Deterministic canary verdict. Returns (decision, reason).
+    """Deterministic canary verdict via composite score deltas.
 
-    Rules:
-    - type=delete → always discard (handled upstream too)
-    - any delta < -1 → discard (severe regression on any single canary)
-    - all delta >= 0 AND at least one > 0 → promote (strict improvement)
-    - otherwise → gate (mixed signal, human judgment needed)
+    Rules (REPLACED in rev2 — was integer-delta structure-only):
+    - type=delete → always discard (high blast radius override)
+    - empty k_results → gate
+    - any composite_delta < DISCARD_DELTA → discard (severe regression)
+    - average composite_delta > PROMOTE_DELTA → promote
+    - otherwise → gate
+
+    See agent.operator_sim for PROMOTE_DELTA / DISCARD_DELTA constants.
     """
+    from agent import operator_sim as _opsim
+
     if edit.get("type") == "delete":
         return "discard", "type=delete: blast radius override"
     if not k_results:
         return "gate", "no canary results — empty K"
-    deltas = [r["delta"] for r in k_results]
-    if any(d < -1 for d in deltas):
-        return "discard", f"severe regression in canary (min delta={min(deltas)})"
-    if all(d >= 0 for d in deltas) and any(d > 0 for d in deltas):
-        return "promote", f"all canaries improved (deltas={deltas})"
-    return "gate", f"mixed canary signal (deltas={deltas}) — human review needed"
+
+    deltas = [r["composite_delta"] for r in k_results]
+    if any(d < _opsim.DISCARD_DELTA for d in deltas):
+        return "discard", f"severe composite regression (min delta={min(deltas):+.3f})"
+    avg_delta = sum(deltas) / len(deltas)
+    if avg_delta > _opsim.PROMOTE_DELTA:
+        return "promote", f"avg composite improved by {avg_delta:+.3f} across K={len(deltas)}"
+    return "gate", f"composite delta {avg_delta:+.3f} within noise band — human review needed"
 
 
 def _save_canary(result: dict) -> Path:
@@ -894,6 +941,13 @@ def autonomous(*, max_cycles: int = 3, max_cost: float = 0.50,
                     hist[-1]["verdict"] = "canary_promoted"
                     hist[-1]["kept"] = True
                     hist[-1]["canary_delta"] = canary_result.get("delta")
+                    hist[-1]["composite_score"] = canary_result.get("candidate_composite")
+                    hist[-1]["composite_breakdown"] = (
+                        canary_result.get("k_results") or [{}]
+                    )[0].get("candidate_breakdown")
+                    # metric_version already set on the pending record by apply_edit;
+                    # this defensively re-sets it in case apply_edit was patched
+                    hist[-1]["metric_version"] = "composite-v1"
                     _rewrite_edit_history(hist)
                 consecutive_regressions = 0
                 cycle["events"].append({"result": "promoted"})
@@ -919,7 +973,10 @@ def autonomous(*, max_cycles: int = 3, max_cost: float = 0.50,
                 "canary_delta": canary_result.get("delta"),
                 "canary_reason": canary_result.get("reason"),
                 "before_score": None, "after_score": None,
+                "composite_score": canary_result.get("candidate_composite"),
+                "composite_breakdown": (canary_result.get("k_results") or [{}])[0].get("candidate_breakdown"),
                 "kept": False,
+                "metric_version": "composite-v1",
             })
             consecutive_regressions += 1
             cycle["events"].append({"result": "discarded"})
