@@ -1,26 +1,32 @@
-# Plan — Meta-eval Tier 2 reframings: operator simulation + few-shot compounding + code-level edits
+# Plan — Meta-eval Tier 2 reframings: operator simulation + few-shot compounding
 
-> Created: 2026-05-27 · Depth: Deep · Source: post-eval re-planning session
+> Created: 2026-05-27 · Revised: 2026-05-27 (post doc-review) · Depth: Deep
 > Parent plan: `docs/plans/2026-05-27-001-feat-meta-eval-loop-plan.md`
 > Eval origin: `docs/solutions/2026-05-27-meta-eval-strict-evaluation.md`
-> Mode: hybrid autonomy continues; this plan **replaces the scoring substrate** that hybrid mode uses, and **expands the edit surface** from prompts to code.
+> Mode: hybrid autonomy continues; this plan **replaces the scoring substrate** that hybrid mode uses.
+
+> **Revision note (rev2).** Six reviewers (coherence, feasibility, product-lens, security-lens, scope-guardian, adversarial) converged on cutting U4 (code-edit sandbox) and U5's code-edit branch. Their independent reasoning: U0 already delivers the only concrete code-bug fix, U4's "always-gate" makes it functionally a `git stash && pytest` wrapper, and the 5 security findings (env-var leak, .env exposure, shell-injection in patch, audit-log integrity, meta_eval.py self-editability) are all mooted by dropping U4. Plan-level decisions applied here per `Apply convergent cuts + safe-auto fixes` routing. Active units: **U0, U1 (merged with U2), U3, U5 (prompt-path only).** Estimated build: **~5-7 hours** (was 10-12).
 
 ## Goal
 
 The strict evaluation revealed three structural limits in the current system:
 1. **The canary metric is saturated** — structure-score caps at 5/5, blind to token efficiency and content quality. A canary that should have promoted (50% token reduction, same structure) got gated.
 2. **Lessons-as-rules don't transfer** — abstract bullets in SYSTEM_PROMPT do not reliably change behavior. The dominant bug (`summarize_missing_documents`) recurred in 6 of 7 runs *with the lesson active*.
-3. **Prompts can't fix what code broke** — the most chronic failure is a tool-schema issue, but the meta-eval can only propose prompt edits.
+3. **Prompts can't fix what code broke** — the most chronic failure is a tool-schema issue. The honest answer to this is **fix it in code directly** (U0), not build autonomous code-editing infrastructure.
 
-This plan addresses all three by **reframing** what the system measures, how it teaches itself, and what it can edit. Together, these convert the loop from "demonstrably bounded autonomy" to "system that actually improves measurably."
+This plan addresses (1) and (2) via reframings, and (3) via a direct human-authored code fix (U0). The result: **the canary measures something meaningful, lessons compound through demonstrations, and the dominant noise pattern is gone before any reframing runs.**
 
-**Non-goals.** Statistical significance testing (K=10+, hypothesis tests). Production observability (LangFuse, dashboards). Multi-tenant deployment. These are Tier 3 — explicitly deferred per user direction.
+**Non-goals.**
+- Autonomous code-editing meta-eval — *dropped from this plan after doc review*. The dominant bug is one human-authored patch (U0) away. Building a sandbox to propose code patches autonomously, when the only concrete motivating case is U0 itself, was solution-in-search-of-problem. The interview-defense story is stronger as "I made the surgical fix and explicitly chose not to build autonomous code-editing" than as "I built a sandbox the human still has to approve."
+- Statistical significance testing (K=10+, hypothesis tests) — Tier 3.
+- Production observability (LangFuse, dashboards) — Tier 3.
+- Multi-tenant deployment — Tier 3.
 
 ---
 
-## Three reframings
+## Two reframings (Reframing C dropped — see Non-goals)
 
-### Reframing A — Operator simulation replaces structure-score
+### Reframing A — Operator simulation + composite verdict replaces structure-score
 
 **What.** Stop measuring briefing form. Start measuring briefing utility to its actual user.
 
@@ -38,7 +44,11 @@ Default weights: `w_op=0.5, w_struct=0.2, w_eff=0.2, w_err=0.1`. Tuneable per
 deployment. Promote if composite delta > 0.05; discard if < -0.10; gate
 otherwise. Thresholds anchored to "noticeable change" rather than "any change."
 
-**Why this matters.** Operator-sim is *unbounded* — a briefing can always answer 1 more question better. The structure-saturation collapse goes away. And the metric directly aligns with what RapidSOS would actually pay for.
+**Why this matters.** Operator-sim has higher resolution than structure-score (6 ordinal levels at coverage = N/5 vs structure's 6 levels at score/5), AND its dimension (utility-to-user) is orthogonal to structural form. Combined with token-efficiency and error-count in the composite, the canary now sees axes structure-only-scoring missed — like the 50%-token-reduction case from today's eval.
+
+**Known limitation — adversarial flagged.** Operator-sim is *also* an LLM-based proxy. LLM judges asked "does this briefing answer this question?" default to generous YES on plausible-sounding text. A 5/5 coverage score on plausible nonsense is the failure mode to watch.
+
+**Mitigation: groundedness sub-check.** For each answered question, the judge must also cite which `[^N]` footnote in the briefing supports it. Coverage counts ONLY questions whose YES answer cites at least one footnote. This collapses the "plausible nonsense" failure path — fabricated answers have no citation to point at.
 
 ---
 
@@ -70,302 +80,247 @@ Demonstrations carry more behavioral signal than rules. Same token budget produc
 
 **Source.** `edit_history.jsonl` (which runs were kept/reverted) cross-referenced with `runs.jsonl` (tool-call traces) — already persisted. Just needs an extractor + formatter.
 
----
+**Known limitation — adversarial flagged.** The `kept=True / kept=False` labels in existing `edit_history.jsonl` were produced by the structure-only canary U1 is replacing. Surfacing them as demonstrations would teach the agent the old (broken) metric's biases.
 
-### Reframing C — Code-level meta-eval
+**Mitigation: gate demonstrations behind N≥3 composite-scored runs.** `load_few_shot_examples()` returns an empty list until at least 3 records exist with `verdict` produced by the composite verdict. Until then, `demonstrations_block()` returns an empty string and SYSTEM_PROMPT is unchanged from the static base. Records produced under the new metric carry `metric_version: "composite-v1"` in `edit_history.jsonl`; the loader filters on this field.
 
-**What.** Allow the meta-eval to propose code changes, not just prompt edits.
-
-**How.** Extend the proposed-edit schema:
-
-```json
-{
-  "id": "E1",
-  "type": "code",
-  "file": "agent/tools/summarize.py",
-  "anchor_function": "run",
-  "diff_unified": "...",
-  "test_diff_unified": "...",
-  "rationale": "..."
-}
-```
-
-Canary for code edits runs:
-1. Apply diff to a scratch copy
-2. Run `pytest -q` against scratch copy → must pass
-3. Run agent on cached canary prompt → score via composite verdict
-4. If structure breaks OR tests fail → discard
-5. Otherwise → **always gate** (code changes never auto-promote; the human reviews)
-
-**Hard rule:** code edits ALWAYS gate for human review regardless of canary outcome. The blast radius is too large for outcome-only autonomy. This makes the autonomous path explicitly bounded for code: meta-eval *proposes*, canary *validates*, human *commits*.
-
-**Why this matters.** The chronic `summarize_missing_documents` bug is one code change away from extinction (make `documents` optional in `summarize.TOOL_SCHEMA` + auto-attach from loop state). Today's system cannot propose this. With C, it can — and the resulting eval data is no longer polluted by a code bug masquerading as a prompt problem.
+**Matching rule (was underspecified).** When cross-referencing `edit_history.jsonl` to `runs.jsonl`, match by: **the most recent run in `runs.jsonl` whose timestamp is BEFORE the edit_history record's timestamp**. This is the run whose eval triggered the edit proposal. If no such run exists within a 24-hour window, skip silently.
 
 ---
 
 ## Architecture choice
 
-Three new modules + extensions to existing ones:
+One new module + extensions to existing ones:
 
-- **`agent/operator_sim.py`** (new, ~80 lines) — operator simulation: question generation + answer judgment + score aggregation
-- **`agent/canary_score.py`** (new, ~60 lines) — composite verdict computation. Pure function, easily unit-testable
-- **`agent/code_edit.py`** (new, ~120 lines) — code-edit application sandbox: scratch-copy, diff apply, pytest runner, rollback
-- **`agent/evaluate.py`** (extend) — `load_few_shot_examples()` reads edit_history + runs.jsonl, formats as demonstrations; replaces `lessons_block()` with `demonstrations_block()`
-- **`agent/meta_eval.py`** (extend) — `META_EVAL_PROMPT` updated to allow `type: code` in proposed_edits; `run_canary` accepts code edits with new branch; `classify_canary` consumes composite score; `autonomous` orchestrator gates code edits hard
-- **`agent/prompts.py`** (target of edits, unchanged structure)
+- **`agent/operator_sim.py`** (new, ~120 lines) — operator simulation (question generation + answer judgment + groundedness check) **and** composite-verdict computation. Merged from the original U1+U2 split per scope-guardian review: composite verdict is a 4-line weighted formula with one consumer; separate module added no value.
+- **`agent/evaluate.py`** (extend) — `load_few_shot_examples()` reads edit_history + runs.jsonl with the timestamp matching rule above, formats as demonstrations; replaces `lessons_block()` with `demonstrations_block()`; honors the `metric_version` filter.
+- **`agent/meta_eval.py`** (extend) — `META_EVAL_PROMPT` unchanged in shape (still prompt-only edits); `run_canary` calls `operator_sim` + composite verdict instead of structure-only; `classify_canary` consumes composite score; new records carry `metric_version: "composite-v1"`.
+- **`agent/tools/summarize.py`** (U0 edits) — `documents` arg becomes optional; loop auto-attaches.
+- **`agent/loop.py`** (U0 edits) — pre-dispatch hook for `summarize` calls without `documents`.
+- **`agent/prompts.py`** (U0 edits) — SYSTEM_PROMPT updated so the documented contract matches the new schema (avoids contradictory signals to the meta-eval).
 
-Why three new modules instead of folding into meta_eval: each has independent purpose, independent test surface, and reusable scope. `operator_sim` should be invokable on any briefing for offline evaluation. `canary_score` is a pure function. `code_edit` is sandboxing infrastructure. Mixing into `meta_eval.py` would push it past 1500 lines and couple unrelated tests.
+Why one new module instead of two (was three): operator_sim and composite_score have one consumer each, share the canary's call path, and the composite formula is ~10 lines. Scope-guardian's argument was sound — splitting added boundary cost with no architectural gain.
 
 ---
 
 ## Pre-work: clear the noise floor
 
-Before any of the reframings, fix the dominant code bug that's polluting eval data. This is **Tier 1b** from the prior list, promoted to a prerequisite here because every Tier 2 reframing operates on data that this bug currently dominates.
+Before any of the reframings, fix the dominant code bug that's polluting eval data. Every reframing operates on signal-quality dimensions this bug currently dominates.
 
-### U0 — Make `summarize.run(documents=None)` accept missing arg
+### U0 — Make `summarize.run(documents=None)` accept missing arg, with loop auto-attach + SYSTEM_PROMPT sync
 
-**Goal.** Eliminate the `summarize_missing_documents` pattern entirely by making the tool contract permissive.
+**Goal.** Eliminate the `summarize_missing_documents` pattern entirely by making the tool contract permissive AND keeping the documented contract (SYSTEM_PROMPT) consistent with the new schema.
 
 **Files.**
-- `agent/tools/summarize.py` (modify): `documents` default `None`; if `None`, the loop is expected to attach cached docs (see below)
-- `agent/loop.py` (modify): when dispatching `summarize` tool call, if input dict lacks `documents`, auto-attach all successfully-fetched docs from the current run's tool history
-- `agent/tools/summarize.py` (modify): `TOOL_SCHEMA` — remove `documents` from `required`, update description to say "documents optional; loop will attach all fetched docs if omitted"
-- `tests/test_loop.py` (modify): add test that summarize without documents arg auto-attaches and succeeds
+- `agent/tools/summarize.py` (modify):
+  - Signature: `def run(prompt: str, documents: list[dict] | None = None)` → coerce `documents or []` internally
+  - `TOOL_SCHEMA`: remove `documents` from `required`; update description to "documents optional; loop will attach all successfully-fetched docs if omitted"
+- `agent/loop.py` (modify): **inside `run()`, NOT `_dispatch_tool()`** — the dispatcher is generic and has no `tool_calls` context. Reuse the existing fallback pattern at `loop.py:167-174` (which already filters cached docs by `text` and `error`). Extract it into a helper `_collect_fetched_docs(tool_calls)`. Before calling `_dispatch_tool` on a `summarize` tool_use that has no `documents` in its input dict, inject `documents=_collect_fetched_docs(tool_calls)` into the input.
+- `agent/prompts.py` (modify): update SYSTEM_PROMPT Strategy step 4 from *"Call summarize ONCE with the original prompt and the fetched documents"* to *"Call summarize ONCE with the original prompt; the loop attaches fetched documents automatically if you omit the `documents` arg, but passing them explicitly is fine"*. Without this edit, the prompt contradicts the new schema and the meta-eval sees mixed signals.
+- `tests/test_loop.py` (modify): add test for auto-attach behavior
 
-**Approach.** The loop already tracks fetched docs in `tool_calls`. When the model calls `summarize(prompt="...")` without `documents`, the dispatch wrapper reads cached docs for every successful fetch this run and injects them. No model behavior change required — the existing prompt strategy still works, but the failure case where the model omits `documents` now succeeds.
+**Approach.** Reuse the existing `loop.py:157-162` fetched-doc collection pattern. Extract to a helper, call it from the new pre-dispatch hook. The model can omit `documents` and the loop attaches what's actually been fetched this run. No behavior change for runs where the model passes `documents` correctly.
+
+**Note on existing test (`tests/test_evaluate.py:68`).** This test asserts the trace_issue fires on the exact error string `"run() missing 1 required positional argument: 'documents'"`. After U0, that error is impossible to produce naturally. Update the test to assert the issue does NOT fire on the auto-attach path, while keeping a separate unit test that the detector logic still works when given a synthetic matching error string (for backward compat).
 
 **Test scenarios.**
 1. Model calls `summarize(prompt="X")` → loop auto-attaches fetched docs → summarize succeeds
-2. Model calls `summarize(prompt="X", documents=[...])` → existing behavior unchanged
-3. Model calls `summarize(prompt="X")` with zero successful fetches → summarize gets empty list, returns the empty-docs stub briefing (existing behavior)
-4. End-to-end: run agent, induce `summarize` without documents via mocked model — should NOT log a trace_issue
+2. Model calls `summarize(prompt="X", documents=[...])` → existing behavior unchanged (model-supplied docs win)
+3. Model calls `summarize(prompt="X")` with zero successful fetches → empty list → empty-docs stub briefing
+4. Trace detector: synthetic error string still fires the trace_issue (backward compat for old logs)
+5. End-to-end: live agent run → next eval record has NO `summarize_missing_documents` in `trace_issues`
 
-**Verification.** Run a full live agent invocation after this lands. The next eval record should show `summarize_missing_documents` is absent from `trace_issues` even if the model "incorrectly" calls summarize without the arg.
+**Verification.** Run a full live agent invocation after this lands. The next eval record should show `summarize_missing_documents` is absent from `trace_issues`.
 
 ---
 
 ## Implementation units
 
-### U1 — `agent/operator_sim.py`: operator follow-up simulation
+### U1 — `agent/operator_sim.py`: operator follow-up simulation + composite verdict
 
-**Goal.** Single Haiku call that turns a (prompt, briefing) pair into a coverage score: "what fraction of the operator's likely follow-up questions does this briefing already answer?"
+**Goal.** One module containing both the operator-utility signal (Haiku call) and the composite verdict that consumes it. Merged from the original U1+U2 per scope-guardian review — composite verdict had one consumer and no separate test surface.
 
 **Files.**
-- `agent/operator_sim.py` (new)
+- `agent/operator_sim.py` (new, ~120 lines)
 - `tests/test_operator_sim.py` (new)
 
-**Approach.** Two stages, one Haiku call combined via structured prompt:
+**Approach.** Two public functions in one module:
+
+```python
+def coverage_score(prompt: str, briefing: str) -> dict:
+    """One Haiku call. Returns {questions, answered, grounded_in_citation, coverage}."""
+
+def composite_score(eval_record: dict, weights=DEFAULT_WEIGHTS) -> dict:
+    """Pure function. Combines coverage + structure + token-delta + error-count."""
+```
+
+`OPERATOR_SIM_PROMPT` extended with the groundedness check:
 
 ```
-OPERATOR_SIM_PROMPT = """You are a RapidSOS operator who has 3 minutes to triage <briefing>.
+You are a RapidSOS operator who has 3 minutes to triage <briefing>.
 
 User prompt: {prompt}
 Briefing: {briefing}
 
-Step 1: List 5 follow-up questions you'd most want answered in your next 30 minutes of work.
-Step 2: For each question, answer YES/NO: does the briefing as-written already answer it?
+Step 1: List 5 follow-up questions you'd most want answered in your next 30 minutes.
+Step 2: For each, answer YES/NO: does the briefing as-written already answer it?
+Step 3: For each YES, cite the [^N] footnote that supports it. If you cannot
+        cite a footnote, the answer must be NO (the briefing is implying
+        without sourcing).
 
 Return STRICT JSON:
-{{
+{
   "questions": ["...", "...", ...],
   "answered": [true, false, true, true, false],
-  "coverage": 0.6
-}}
-"""
+  "citations": ["[^2]", "", "[^4]", "[^1,3]", ""],
+  "coverage": 0.4   # only YES with non-empty citation count
+}
 ```
 
-Coverage = `sum(answered) / len(questions)`. Pure compositional — feeds into composite verdict.
+Coverage = `sum(answered[i] AND citations[i] != "") / len(questions)`. Defeats plausible-nonsense judge bias.
 
-Caching: same briefing → same operator-sim score. Cache by `hash(briefing)` to avoid re-paying for repeated evaluations within one autonomous session.
+Caching: same briefing → same coverage score. Cache by `hash(briefing)` to avoid re-paying within one autonomous session.
 
-**Test scenarios.**
-1. Mocked Haiku response → returns coverage between 0 and 1 with matching question/answer length
-2. Briefing answering 5/5 → coverage = 1.0
-3. Briefing answering 0/5 → coverage = 0.0
-4. Cache hit: same briefing → returns from cache, no Haiku call
-5. Malformed JSON from Haiku → returns `{error: ..., coverage: 0.0}` (conservative default)
-6. Briefing < 100 chars (likely a fallback stub) → coverage = 0.0 without LLM call
-
-**Cost.** ~$0.005 per evaluation with Haiku. Caching makes repeated canary use of the same baseline briefing free.
-
----
-
-### U2 — `agent/canary_score.py`: composite verdict
-
-**Goal.** Pure function that consumes `{baseline, candidate}` briefings + traces and emits a composite score. No I/O, fully unit-testable.
-
-**Files.**
-- `agent/canary_score.py` (new)
-- `tests/test_canary_score.py` (new)
-
-**Approach.** Single function:
-
-```python
-def composite_score(briefing, eval_record, weights=DEFAULT_WEIGHTS) -> dict:
-    """Returns {composite, breakdown: {structure, operator, efficiency, errors}}."""
+Composite formula:
 ```
-
-`eval_record` is the full eval shape (structure + trace_issues + judge + operator_sim). The function combines components into one float in [0, 1] for ordering and supplies the breakdown for the audit log.
-
-Verdict thresholds:
+score = w_op * coverage             # 0..1, primary
+      + w_struct * structure_score / 5
+      + w_eff * clip(-token_delta_normalized, -1, 1)
+      + w_err * clip(-error_count, -1, 1)
+```
+Default `w_op=0.5, w_struct=0.2, w_eff=0.2, w_err=0.1`. Verdict thresholds (anchored to noticeable change):
 - `delta > 0.05` → `promote`
 - `delta < -0.10` → `discard`
 - otherwise → `gate`
 
-These are anchored to *noticeable* change, not any change — reduces noise-driven flapping.
+**Contract migration (was F3 — undefined before).** The existing `classify_canary` in `meta_eval.py:731-749` uses integer structure-score deltas. **U1 REPLACES `classify_canary` entirely** — the composite function becomes the only verdict path. K-result records' shape changes from `{baseline_score: int, candidate_score: int, delta: int}` to `{baseline_eval: dict, candidate_eval: dict, composite_delta: float, breakdown: dict}`. Existing canary records in `data/logs/canary/` are tagged `metric_version: "structure-v0"` and remain on disk for historical reference but are NOT used by demonstrations or future verdicts. New records carry `metric_version: "composite-v1"`.
 
 **Test scenarios.**
-1. Identical baseline/candidate → delta = 0.0 → `gate`
-2. Candidate 50% fewer tokens, same structure, same operator-sim → delta > 0.05 → `promote` (THE case the saturated metric failed today)
-3. Candidate same structure, operator-sim drops 0.4 → delta < -0.10 → `discard`
-4. Candidate +1 summarize error, otherwise neutral → delta penalized by err weight → likely `discard`
-5. Weights override: passing custom weights changes the verdict on borderline cases
+1. Mocked Haiku → returns coverage 0..1 with matching question/answer/citation lengths
+2. Briefing answering 5/5 with all citations → coverage = 1.0
+3. Briefing answering 5/5 with NO citations → coverage = 0.0 (groundedness gate caught the nonsense case)
+4. Cache hit: same briefing → no second Haiku call
+5. Malformed JSON from Haiku → `{error: ..., coverage: 0.0}` (conservative default)
+6. Briefing < 100 chars → coverage = 0.0 without LLM call
+7. Composite — identical baseline/candidate → delta = 0.0 → `gate`
+8. Composite — candidate 50% fewer tokens, same coverage, same structure → delta > 0.05 → `promote` (THE case today's structure-only canary failed)
+9. Composite — candidate coverage drops 0.4 → delta < -0.10 → `discard`
+10. Composite — candidate +1 summarize error, otherwise neutral → delta penalized
+
+**Cost.** ~$0.005 per coverage call. Caching makes repeated canary use of same baseline free. Per-canary overhead vs structure-only: ~$0.01.
 
 ---
 
-### U3 — `agent/evaluate.py`: few-shot demonstrations replace lessons block
+### U2 — MERGED INTO U1 (composite verdict folded in)
 
-**Goal.** Replace `lessons_block()` output with concrete (prompt, behavior, score) demonstrations sourced from kept/reverted runs.
+Original U2 (`agent/canary_score.py` as a separate module) deleted per scope-guardian Finding 2. The composite formula is ~10 lines with one consumer; separate module added boundary cost without architectural gain. Test scenarios absorbed into U1's test file.
+
+---
+
+### U3 — `agent/evaluate.py`: few-shot demonstrations replace lessons block (with poisoned-label gate)
+
+**Goal.** Replace `lessons_block()` output with concrete (prompt, behavior, score) demonstrations sourced from kept/reverted runs **scored under the new composite verdict**. Pre-composite records are excluded to prevent teaching old-metric biases.
 
 **Files.**
 - `agent/evaluate.py` (modify): new `load_few_shot_examples()` + `demonstrations_block()`; `lessons_block()` deprecated but kept for backward compat
 - `agent/loop.py` (modify): switch the SYSTEM_PROMPT append from `lessons_block()` to `demonstrations_block()`
-- `tests/test_evaluate.py` (modify): new tests for few-shot extraction
+- `agent/meta_eval.py` (modify): when writing edit_history records, tag with `metric_version` field
+- `tests/test_evaluate.py` (modify): new tests for few-shot extraction + version-gate
 
-**Approach.** `load_few_shot_examples(n_good=2, n_bad=1)`:
-1. Read `edit_history.jsonl`; filter to `kept=True` (good) and `kept=False` (bad)
-2. For each, look up the associated agent run in `runs.jsonl` by timestamp proximity
-3. Extract: prompt, tool-call sequence, briefing snippet (first 200 chars), composite score (if available)
-4. Format compactly:
+**Approach.** `load_few_shot_examples(n_good=2, n_bad=1, min_records=3)`:
+1. Read `edit_history.jsonl`; filter to records with `metric_version == "composite-v1"`
+2. If fewer than `min_records` (default 3) composite-scored records exist → return empty list (the poisoned-label gate)
+3. Among remaining: filter to `kept=True` (good) and `kept=False` (bad); sort by composite score
+4. For each, find the associated agent run via the timestamp-matching rule (most recent run BEFORE the edit_history timestamp, within 24h)
+5. Extract: prompt, tool-call sequence, briefing snippet (first 200 chars), composite breakdown
+6. Format compactly:
 
 ```
-## Good runs (compounding from kept edits)
-[2026-05-27 score=0.78]
+## Good runs (compounding from kept edits, scored under composite verdict)
+[2026-05-27 score=0.78 op=0.8 struct=1.0 tokens=-30%]
 Prompt: "Competitive intel on Carbyne..."
 Trace: 3 searches → 5 fetches → 1 summarize
 Briefing snippet: "TL;DR: Both RapidDeploy and Carbyne saw..."
 
 ## Anti-patterns (avoid these)
-[2026-05-26 score=0.20]
+[2026-05-26 score=0.20 op=0.2 struct=0.0 tokens=+15%]
 Prompt: "Top 3 stories..."
 Trace: 8 searches → 9 fetches → 3 failed summarize → inline fallback
 ```
 
 **Test scenarios.**
-1. Empty edit_history → empty demonstrations block (degrades to current SYSTEM_PROMPT)
-2. One kept + one reverted → demonstrations block contains both, correctly labeled
-3. Missing matching run in runs.jsonl → skip silently, do not crash
-4. Token-budget cap: long briefings truncated to 200 chars, full output stays under 500 tokens
-5. Backward compat: `lessons_block()` still callable; importers continue to work
+1. Empty edit_history → empty demonstrations block (degrades to base SYSTEM_PROMPT)
+2. 2 records but both pre-composite (`metric_version="structure-v0"`) → empty demonstrations block
+3. 3+ composite-scored records, mix of kept/reverted → demonstrations block populated
+4. Missing matching run in runs.jsonl (no run within 24h before edit) → skip that record silently
+5. Token-budget cap: long briefings truncated to 200 chars, full output stays under 500 tokens
+6. Backward compat: `lessons_block()` still callable; importers continue to work
 
 ---
 
-### U4 — `agent/code_edit.py`: code-edit sandbox
+### U4 — DROPPED (code-edit sandbox)
 
-**Goal.** Apply a unified diff to a scratch copy of the repo, run pytest, return pass/fail + score. Never touches the live tree until human-approved.
+Per doc review convergence (product-lens F3, scope-guardian F4, adversarial F2, security-lens 5 findings). The single concrete code-bug motivating this unit is fixed by U0 in 30 minutes. After U0, no second motivating case exists. The "always-gate" policy reduces autonomous value-add to "git stash && pytest" with a Haiku API call. Security findings (env-var leak, .env exposure, patch-shell-injection, audit-log integrity, meta_eval.py self-editability) all moot when U4 doesn't ship.
 
-**Files.**
-- `agent/code_edit.py` (new)
-- `tests/test_code_edit.py` (new)
-
-**Approach.** Use a tempdir-based scratch repo:
-
-```python
-def evaluate_code_edit(diff_unified, test_diff_unified=None, run_pytest=True) -> dict:
-    """
-    1. Copy repo (minus .venv, data/) to a tempdir
-    2. Apply diff_unified via `patch` or python's difflib.parse_unified
-    3. If test_diff_unified: apply it too
-    4. If run_pytest: run pytest in tempdir, capture pass/fail + output
-    5. Optionally run a canary agent invocation in the scratch repo (deferred)
-    6. Clean up tempdir
-    Returns: {applied: bool, pytest_passed: bool, pytest_output: str, error: str|None}
-    """
-```
-
-**Test scenarios.**
-1. Trivial diff (rename a variable) → applied, pytest passes
-2. Diff that breaks syntax → applied fails OR pytest fails — caught
-3. Diff that doesn't apply (anchor mismatch) → applied=False, clear error
-4. Diff with test_diff that exercises the change → both apply, pytest passes
-5. Sandbox isolation: live repo files are byte-identical after run regardless of outcome
-
-**Critical safety.** This module NEVER mutates the live tree. All operations happen in tempdir. The orchestrator decides what to do with the verdict.
+Defer to a post-interview session if and when a second code-level bug class emerges in eval data.
 
 ---
 
-### U5 — `agent/meta_eval.py`: wire reframings into propose + canary + autonomous
+### U5 — `agent/meta_eval.py`: wire reframings (prompt-path only)
 
-**Goal.** Update `META_EVAL_PROMPT` to allow code-type edits. Update `run_canary` to dispatch by edit type. Update `autonomous` to always-gate code edits.
+**Goal.** Wire operator-sim + composite verdict into the existing prompt-edit canary path. No code-edit branch.
 
 **Files.**
-- `agent/meta_eval.py` (modify): `META_EVAL_PROMPT` adds code-edit schema documentation + examples; `run_canary` branches on `edit.type`; `autonomous` recognizes code edits as always-gate
-- `tests/test_meta_eval.py` (extend): new tests for code-edit canary path
+- `agent/meta_eval.py` (modify): `run_canary` calls `operator_sim.coverage_score` + `operator_sim.composite_score` instead of structure-only scoring; `classify_canary` REPLACED with composite logic per U1 contract migration; new records tagged `metric_version: "composite-v1"`
+- `tests/test_meta_eval.py` (modify): update existing tests to expect composite verdict shape
 
 **Approach.** Three changes:
 
-1. **META_EVAL_PROMPT extension.** Add a section explaining when to propose code edits vs prompt edits:
-   - Tool-contract bugs (e.g., schema issues) → propose code edit
-   - Strategy / verbosity / formatting → propose prompt edit
-   - Prefer minimal diffs; never modify tests in ways that mask the bug
+1. **No META_EVAL_PROMPT change.** The prompt-edit schema (add/replace/delete with anchor) is unchanged. Removing the code-edit branch keeps the proposer's surface tight.
 
-2. **run_canary dispatcher.**
-   ```python
-   if edit["type"] == "code":
-       return run_code_canary(edit)
-   elif edit["type"] in ("add", "replace", "delete"):
-       return run_prompt_canary(edit)
-   ```
-   `run_code_canary` calls `code_edit.evaluate_code_edit()` + (if pytest passes) runs `replay.replay_run` against a cached canary prompt with the patched code in the sandbox.
+2. **run_canary swaps scoring.** Replace structure-score evaluation with composite verdict from U1. Per-K-iteration record now carries `{baseline_eval, candidate_eval, composite_delta, breakdown, metric_version}` instead of int deltas.
 
-3. **autonomous hard-gate.** Any code edit returns `gate` from `classify_canary` regardless of canary outcome. Reason field: `"code edit: always gates for human review"`.
+3. **classify_canary replaced.** Old integer-delta version retired. New version reads composite_delta directly. Single decision path.
 
 **Test scenarios.**
-1. Mocked propose returns code edit → autonomous gates, no live mutation
-2. Code edit with passing pytest + improved score → canary record shows promote-eligible, but classify returns `gate` (override fires)
-3. Code edit with failing pytest → canary record shows `discard`
-4. Prompt edit still flows through the prompt path (no regression)
-5. Edit history records `type` (code|add|replace|delete) so future propose calls see it
+1. Mocked operator-sim returns coverage 0.8 for both → composite delta near 0 → gate
+2. Candidate token-delta -30%, same coverage → composite delta > 0.05 → promote (the case today's canary missed)
+3. Candidate coverage drops 0.4, structure unchanged → composite delta < -0.10 → discard
+4. New canary records carry `metric_version: "composite-v1"`
+5. Existing structure-only tests pass (after updating to new contract)
 
 ---
 
-### U6 — Integration & live demo verification
+### U6 — DROPPED as a unit (folded into Verification gates)
 
-**Goal.** End-to-end run of the reframed system. Confirm the saturated-metric collapse is fixed AND code edits gate correctly.
-
-**Files.** None — runtime verification only.
-
-**Approach.**
-1. **Confirm U0 fix lands.** Run agent on a fresh prompt. Verify no `summarize_missing_documents` trace_issue.
-2. **Confirm composite verdict works.** Run autonomous mode (Haiku). The first proposed edit that gives token reduction should now `promote` (today it gated).
-3. **Confirm operator-sim signal.** Inspect eval records — they now include `operator_sim.coverage` field.
-4. **Confirm few-shot demos.** Run `python -m agent.meta_eval status` — output should show demonstrations, not abstract lessons.
-5. **Confirm code edit path.** Trigger a propose where Haiku is biased toward a code suggestion (e.g., by adding a hint in META_EVAL_PROMPT). Verify the autonomous mode gates and writes a complete audit including diff + pytest result.
-
-**Cost budget.** ~$0.40-0.60 for the full verification run (5-6 Haiku invocations + 1-2 full agent runs).
+Per scope-guardian Finding 5: U6 was runtime verification, not implementation. Its content is the verification gates section below.
 
 ---
 
 ## Risks & mitigations
 
-- **R1 — Operator-sim is itself an LLM and could be miscalibrated.** Two LLMs (sim + judge) → noise compounds. Mitigation: composite verdict weights structure_score and token-delta at 40% combined; even if operator-sim is noisy, the verdict isn't dominated by it.
-- **R2 — Few-shot examples could leak prompts that ARE the bug.** If we promote a kept-edit that was actually lucky, the demonstration teaches the wrong behavior. Mitigation: only promote when composite delta > 0.05; raise this threshold over time if pattern leaks appear.
-- **R3 — Code edits in a scratch tempdir might miss environment-specific failures.** Pytest passes in tempdir but fails in CI/prod. Mitigation: tempdir copies `.env` (without secrets), `pytest.ini`, and other config; CI-level validation is Tier 3.
-- **R4 — Cumulative cost spike.** Each canary now does operator-sim too. Mitigation: cache operator-sim by briefing hash; one canary pair = baseline_op_sim + candidate_op_sim = ~$0.01 added overhead.
-- **R5 — Backward compatibility break.** Existing eval records don't have operator_sim or composite fields. Mitigation: defensive reads; missing fields default to neutral (no penalty/bonus).
+- **R1 — Operator-sim is itself an LLM and could be miscalibrated.** Two LLMs (sim + judge) → noise compounds. Mitigation: composite verdict weights structure_score and token-delta at 40% combined; even if operator-sim is noisy, the verdict isn't dominated by it. **Additional mitigation (adversarial-flagged):** groundedness check requires each YES to cite a `[^N]` footnote, defeating plausible-nonsense judge bias.
+- **R2 — Few-shot examples could leak prompts that ARE the bug.** If we promote a kept-edit that was actually lucky, the demonstration teaches the wrong behavior. Mitigation: only promote when composite delta > 0.05. **Additional mitigation (adversarial-flagged):** demonstrations gated behind ≥3 composite-scored records (`metric_version="composite-v1"`); pre-composite records excluded.
+- **R3 — Cumulative cost spike.** Each canary now does operator-sim too. Mitigation: cache operator-sim by briefing hash; one canary pair = baseline_op_sim + candidate_op_sim = ~$0.01 added overhead. **Verification cost (feasibility F6):** total verification budget revised to ~$0.50-0.80 (was $0.40-0.60) for one autonomous cycle + 1 fresh agent run.
+- **R4 — Backward compatibility break.** Existing eval records don't have operator_sim or composite fields. Pre-composite edit_history records have `kept` decided under the old metric. Mitigations: defensive reads (missing fields default to neutral); `metric_version` field distinguishes old vs new records; demonstrations gate on `metric_version="composite-v1"` (R2).
+- **R5 — U0 contract change ripples.** Making `documents` optional affects `summarize.TOOL_SCHEMA`, `SYSTEM_PROMPT`, existing test `test_evaluate.py:68` (which asserts the exact error string), and the loop's pre-dispatch hook. Mitigation: U0's file list now explicitly enumerates all four touch points; test update preserves backward-compat for the detector logic.
 
 ---
 
-## Verification gates
+## Verification gates (was U6; folded in here per scope-guardian Finding 5)
 
-1. All U0-U5 unit tests pass (`pytest tests/test_*.py`)
-2. U0 verified live: `summarize_missing_documents` absent from new eval records
-3. U2 verified: `composite_score` correctly orders the case that today's structure-only canary mis-gated (token reduction without quality loss → promote)
-4. U3 verified: SYSTEM_PROMPT at runtime contains demonstrations, not abstract bullets
-5. U4 verified: code edit applies in scratchdir, pytest runs, live tree unchanged
-6. U5 verified: autonomous run with a code edit always returns `gate` even if canary signals strong
-7. U6 verified: real autonomous cycle now produces a `promote` verdict on the historically-mis-gated case
-8. Existing test suite still passes (110/110 + new tests)
+**Unit tests:**
+1. All U0, U1, U3, U5 unit tests pass (`pytest tests/test_*.py`)
+2. Existing test suite still passes (110/110 + new tests; existing test_evaluate.py:68 updated per U0 notes)
+
+**Live verification (single autonomous cycle + 1 fresh agent run, budget ~$0.50-0.80):**
+3. **U0 verified live:** run agent on a fresh prompt → `summarize_missing_documents` absent from the new eval record's `trace_issues`
+4. **U1 composite verdict verified:** the historically-mis-gated case (token reduction with same structure) now produces `composite_delta > 0.05` → `promote`. Verify on the cached "top 3 public safety AI stories" canary that today's structure-only canary gated at delta=0.
+5. **U1 groundedness verified:** inspect the operator_sim record — at least one `YES` answer has an empty citation field, demonstrating the gate is functional (not always-true).
+6. **U3 demonstrations gate verified:** until ≥3 composite-scored edit_history records exist, `demonstrations_block()` returns empty string. SYSTEM_PROMPT runtime should be unchanged from base for the first 2 autonomous cycles after this lands.
+7. **U5 contract migration verified:** new canary records carry `metric_version="composite-v1"`. Old records still readable but excluded from demonstrations.
+
+**Verification budget:** ~$0.50-0.80 (revised from $0.40-0.60 per feasibility F6). Within the ~$1.70 remaining budget.
 
 ---
 
@@ -375,17 +330,21 @@ Riskiest first when build cost is similar; sequential when each unit unlocks the
 
 | # | Unit | Why now | Est. build |
 |---|------|---------|------------|
-| 1 | **U0** (summarize bug fix) | Removes noise from all downstream eval data | 30 min |
-| 2 | **U1** (operator-sim) | Single highest-impact addition — solves saturated-metric collapse | 2-3 hr |
-| 3 | **U2** (composite verdict) | Tiny wrapper, makes U1 actually drive verdicts | 1 hr |
-| 4 | **U3** (few-shot demos) | Independent of U4; ships compounding | 1.5 hr |
-| 5 | **U4** (code edit sandbox) | Highest risk, most novel; tempdir/patch infrastructure needs care | 3-4 hr |
-| 6 | **U5** (wiring) | Glue; small | 1 hr |
-| 7 | **U6** (live demo) | Verification only | 30 min runtime + $0.40-0.60 cost |
+| 1 | **U0** (summarize bug fix + SYSTEM_PROMPT sync) | Removes the dominant noise pattern. Without this, U1/U3 measurements are unreliable | 45 min (was 30; SYSTEM_PROMPT edit + test update) |
+| 2 | **U1** (operator-sim + composite verdict, merged) | Solves the saturated-metric collapse. Includes groundedness check + composite formula | 3-4 hr (was 2-3 + 1 separate) |
+| 3 | **U3** (few-shot demos with poisoned-label gate) | Independent of U1's internals; the `metric_version` gate keeps it safe to ship in parallel | 2 hr (was 1.5; added gate logic) |
+| 4 | **U5** (prompt-path wiring + classify_canary replacement) | Glue: replaces classify_canary with composite, swaps run_canary scoring path | 1 hr |
+| 5 | Verification run | Single autonomous cycle + 1 fresh agent run; verify gates 3-7 | 30 min runtime + $0.50-0.80 cost |
 
-**Total estimated build:** ~10-12 hours of code + tests. **Verification cost:** under $1 of remaining Anthropic budget.
+**Total estimated build:** ~7-8 hours of code + tests (was 10-12). **Verification cost:** $0.50-0.80 of remaining $1.70 budget.
 
-For interview defense: shipping U0+U1+U2 alone (≈4 hours) lands the strongest single answer to "your metric was wrong." U3 is cheap follow-up. U4+U5 is the genuinely novel piece worth a longer session.
+**Cut scope vs original plan:**
+- U2 merged into U1 — saved 1h boundary cost, no architectural loss
+- U4 dropped entirely — saved 3-4h, eliminated 5 P1 security findings
+- U5 code-edit branch dropped — saved ~30 min, simplified wiring
+- U6 dropped as a numbered unit — folded into Verification gates
+
+For interview defense: this revised plan IS the strongest single answer. Each unit ties to a measured failure mode from today's strict eval. The dropped U4 IS the defensible story: *"I deliberately chose not to build autonomous code-editing — the dominant bug was one human-authored patch (U0) away. The interview-defense story is stronger as bounded autonomy with surgical code fixes than as a sandbox a human still has to approve."*
 
 ---
 
@@ -402,6 +361,8 @@ For interview defense: shipping U0+U1+U2 alone (≈4 hours) lands the strongest 
 
 ## Next step
 
-Plan at `docs/plans/2026-05-27-002-feat-meta-eval-tier2-reframings-plan.md`. Ready to execute.
+Plan revised post doc-review. Ready to execute.
 
-Recommended start: **U0** (30-minute prerequisite that eliminates the dominant noise pattern from all subsequent measurements). Then U1+U2 as the strongest single demo addition.
+Recommended start: **U0** (45-minute prerequisite that eliminates the dominant noise pattern from all subsequent measurements + syncs SYSTEM_PROMPT to the new contract). Then U1 (merged operator-sim + composite verdict) as the strongest single demo addition. U3 (with the metric_version gate) ships compounding without poisoning from old labels. U5 is glue.
+
+**For interview defense:** the revised plan reduces surface area while delivering the same insight. The decision to cut U4 is itself the senior-engineer judgment story — "I noticed the meta-eval was tempting me to build autonomous code-editing, recognized that the dominant bug was one human patch away, and explicitly chose the surgical fix over the elaborate machinery."
