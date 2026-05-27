@@ -577,8 +577,10 @@ def _select_canary_prompt() -> tuple[str | None, list[str]]:
     """Pick a historical prompt for canary use + its cached URL set.
 
     Strategy: find the most recent COMPLETE run in runs.jsonl whose briefing
-    cites ≥2 URLs we have in the fetch cache. Returns (prompt, urls) or
-    (None, []) if nothing usable.
+    cites ≥2 URLs we have in the fetch cache. Falls back to filename-slug
+    glob if the exact briefing_path from the log is missing (briefings may
+    have been renamed). Returns (prompt, urls) or (None, []) if nothing
+    usable.
     """
     runs_path = storage.LOGS / "runs.jsonl"
     if not runs_path.exists():
@@ -592,26 +594,31 @@ def _select_canary_prompt() -> tuple[str | None, list[str]]:
             runs.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-    # Iterate newest-first
     url_pattern = re.compile(r"\[\^(\d+)\]:\s*\[[^\]]+\]\((https?://[^)\s]+)\)")
+    briefings_dir = storage.BRIEFINGS
     for run in reversed(runs):
         if run.get("status") != "complete":
             continue
-        briefing_rel = run.get("briefing_path")
-        if not briefing_rel:
-            continue
-        # briefing_path may be absolute or relative
+        briefing_rel = run.get("briefing_path") or ""
+        # Try exact path first
         briefing_path = Path(briefing_rel)
         if not briefing_path.is_absolute():
             briefing_path = storage.ROOT / briefing_rel
         if not briefing_path.exists():
-            continue
+            # Glob fallback: match by timestamp prefix (first 15 chars of slug)
+            stem = Path(briefing_rel).stem
+            if stem:
+                prefix = stem[:15]  # YYYYMMDD-HHMMSS
+                candidates = sorted(briefings_dir.glob(f"{prefix}*.md"))
+                if candidates:
+                    briefing_path = candidates[0]
+                else:
+                    continue
+            else:
+                continue
         text = briefing_path.read_text(encoding="utf-8", errors="replace")
         urls = list(dict.fromkeys(m.group(2) for m in url_pattern.finditer(text)))
-        cached_urls = []
-        for url in urls:
-            if storage.load_fetched(url) is not None:
-                cached_urls.append(url)
+        cached_urls = [u for u in urls if storage.load_fetched(u) is not None]
         if len(cached_urls) >= 2:
             return run["prompt"], cached_urls
     return None, []
