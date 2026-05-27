@@ -205,3 +205,123 @@ def test_load_recent_lessons_deduplicates(temp_data_dir):
     evaluate.save_eval(record)
     lessons = evaluate.load_recent_lessons()
     assert lessons.count("Always call summarize with documents.") == 1
+
+
+# ---------- U3: few-shot demonstrations with metric_version gate ----------
+
+def _write_edit_history(temp_data_dir, records: list[dict]):
+    """Helper: write records to data/logs/edit_history.jsonl."""
+    from agent import storage
+    path = storage.LOGS / "edit_history.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+
+
+def _write_runs(temp_data_dir, runs: list[dict]):
+    from agent import storage
+    path = storage.LOGS / "runs.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in runs) + "\n")
+
+
+def test_load_few_shot_examples_empty_when_no_edit_history(temp_data_dir):
+    out = evaluate.load_few_shot_examples()
+    assert out["ready"] is False
+    assert out["good"] == []
+    assert out["bad"] == []
+
+
+def test_load_few_shot_examples_gates_on_metric_version(temp_data_dir):
+    """Records without metric_version=composite-v1 are EXCLUDED entirely.
+    Poisoned-label gate per adversarial F3."""
+    _write_edit_history(temp_data_dir, [
+        {"timestamp": "2026-05-26T10:00:00+00:00", "kept": True,
+         "metric_version": "structure-v0"},  # pre-composite — excluded
+        {"timestamp": "2026-05-26T11:00:00+00:00", "kept": False},  # no version — excluded
+        {"timestamp": "2026-05-26T12:00:00+00:00", "kept": True,
+         "metric_version": "composite-v1"},  # included (only 1)
+    ])
+    out = evaluate.load_few_shot_examples()
+    # Only 1 composite-v1 record < min_records=3 → not ready
+    assert out["ready"] is False
+    assert out["n_composite_records"] == 1
+
+
+def test_load_few_shot_examples_ready_at_min_records(temp_data_dir):
+    """≥3 composite-v1 records → demonstrations block populated."""
+    _write_runs(temp_data_dir, [
+        {"timestamp": "2026-05-26T09:00:00+00:00", "prompt": "good prompt", "tool_calls": [
+            {"name": "search"}, {"name": "fetch"}, {"name": "summarize"}
+        ], "briefing_path": "data/briefings/g.md"},
+        {"timestamp": "2026-05-26T10:30:00+00:00", "prompt": "bad prompt", "tool_calls": [
+            {"name": "search"}, {"name": "search"}, {"name": "search"}, {"name": "summarize", "error": "x"}
+        ], "briefing_path": "data/briefings/b.md"},
+        {"timestamp": "2026-05-26T11:30:00+00:00", "prompt": "third prompt", "tool_calls": [
+            {"name": "summarize"}
+        ]},
+    ])
+    _write_edit_history(temp_data_dir, [
+        {"timestamp": "2026-05-26T09:30:00+00:00", "kept": True,
+         "metric_version": "composite-v1", "composite_score": 0.78},
+        {"timestamp": "2026-05-26T11:00:00+00:00", "kept": False,
+         "metric_version": "composite-v1", "composite_score": 0.30},
+        {"timestamp": "2026-05-26T12:00:00+00:00", "kept": True,
+         "metric_version": "composite-v1", "composite_score": 0.82},
+    ])
+    out = evaluate.load_few_shot_examples()
+    assert out["ready"] is True
+    assert out["n_composite_records"] == 3
+    # Two kept records → 2 good (default n_good=2)
+    assert len(out["good"]) == 2
+    # One reverted record → 1 bad
+    assert len(out["bad"]) == 1
+
+
+def test_load_few_shot_examples_skips_when_no_matching_run(temp_data_dir):
+    """edit_history record with no run within the 24h window → skipped silently."""
+    _write_runs(temp_data_dir, [
+        # All runs are >24h before the edit timestamps below
+        {"timestamp": "2026-01-01T00:00:00+00:00", "prompt": "ancient", "tool_calls": []},
+    ])
+    _write_edit_history(temp_data_dir, [
+        {"timestamp": "2026-05-26T10:00:00+00:00", "kept": True,
+         "metric_version": "composite-v1"},
+        {"timestamp": "2026-05-26T11:00:00+00:00", "kept": True,
+         "metric_version": "composite-v1"},
+        {"timestamp": "2026-05-26T12:00:00+00:00", "kept": True,
+         "metric_version": "composite-v1"},
+    ])
+    out = evaluate.load_few_shot_examples()
+    # Ready (3 composite records exist) but no examples built (no matching runs)
+    assert out["ready"] is True
+    assert out["good"] == []
+    assert out["bad"] == []
+
+
+def test_demonstrations_block_empty_when_not_ready(temp_data_dir):
+    """Until min_records hit, demonstrations_block returns empty string."""
+    assert evaluate.demonstrations_block() == ""
+
+
+def test_demonstrations_block_renders_good_and_bad(temp_data_dir):
+    """Once ready, block contains both good runs and anti-patterns sections."""
+    examples = {
+        "ready": True,
+        "n_composite_records": 3,
+        "good": [{
+            "edit_timestamp": "2026-05-26T09:30:00+00:00",
+            "composite_score": 0.78,
+            "prompt": "good prompt", "trace": "1 search · 2 fetch · 1 summarize",
+            "briefing_snippet": "TL;DR: results...",
+        }],
+        "bad": [{
+            "edit_timestamp": "2026-05-26T11:00:00+00:00",
+            "composite_score": 0.30,
+            "prompt": "bad prompt", "trace": "3 search · 1 error(s)",
+            "briefing_snippet": "TL;DR: thin...",
+        }],
+    }
+    block = evaluate.demonstrations_block(examples)
+    assert "Good runs (kept after canary)" in block
+    assert "Anti-patterns" in block
+    assert "good prompt" in block
+    assert "bad prompt" in block
+    assert "1 search · 2 fetch · 1 summarize" in block

@@ -85,9 +85,15 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
     tools = [schema for schema, _ in TOOL_REGISTRY.values()]
     messages: list[dict] = [{"role": "user", "content": user_prompt}]
 
-    # Compounding loop: prepend prior-run lessons to SYSTEM_PROMPT.
-    lessons = evaluate.load_recent_lessons() if self_eval else []
-    system_prompt = prompts.SYSTEM_PROMPT + evaluate.lessons_block(lessons)
+    # Compounding loop: append few-shot demonstrations to SYSTEM_PROMPT.
+    # demonstrations_block returns "" until ≥3 composite-v1 edit_history
+    # records exist (metric_version gate per U3 — prevents teaching the old
+    # saturated-metric biases via demonstrations from pre-composite runs).
+    # Until then SYSTEM_PROMPT is unchanged from the static base.
+    system_prompt = prompts.SYSTEM_PROMPT
+    if self_eval:
+        demo_block = evaluate.demonstrations_block()
+        system_prompt = system_prompt + demo_block
 
     tool_calls: list[dict] = []
     last_summarize_briefing: str | None = None  # set after every successful summarize dispatch

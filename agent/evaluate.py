@@ -218,6 +218,11 @@ def load_recent_lessons(n: int = MAX_LESSONS) -> list[str]:
 def lessons_block(lessons: list[str]) -> str:
     """Format lessons as a markdown block to append to SYSTEM_PROMPT.
 
+    DEPRECATED — kept for backward compat. Use `demonstrations_block()` instead
+    (U3). Lessons-as-rules don't transfer reliably per the strict eval; the
+    successor mechanism is few-shot demonstrations sourced from kept/reverted
+    runs scored under the composite verdict.
+
     Empty list → empty string (no-op append).
     """
     if not lessons:
@@ -227,3 +232,207 @@ def lessons_block(lessons: list[str]) -> str:
         "\n\n## Recent lessons (from prior runs — apply them)\n"
         f"{bullets}\n"
     )
+
+
+# ============================================================
+# U3: few-shot demonstrations replacing abstract lessons
+# ============================================================
+
+# Marker for edit_history records produced under the new composite verdict.
+# Records without this field (or with structure-v0) are excluded from
+# demonstrations to prevent teaching old-metric biases.
+COMPOSITE_METRIC_VERSION = "composite-v1"
+MIN_COMPOSITE_RECORDS = 3
+MAX_DEMO_BRIEFING_CHARS = 200
+MAX_TIMESTAMP_WINDOW_HOURS = 24
+
+
+def _parse_iso(ts: str):
+    """Parse ISO 8601 timestamp, returning None on failure."""
+    from datetime import datetime
+    if not ts:
+        return None
+    try:
+        # Normalize trailing Z to +00:00 for fromisoformat compat
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _find_matching_run(edit_record: dict, runs: list[dict]) -> dict | None:
+    """Find the most recent run in `runs` whose timestamp is BEFORE the edit
+    record's timestamp, within MAX_TIMESTAMP_WINDOW_HOURS. This is the run
+    whose eval triggered the edit proposal.
+    """
+    from datetime import timedelta
+    edit_ts = _parse_iso(edit_record.get("timestamp", ""))
+    if edit_ts is None:
+        return None
+    window = timedelta(hours=MAX_TIMESTAMP_WINDOW_HOURS)
+    best = None
+    for r in runs:
+        run_ts = _parse_iso(r.get("timestamp", ""))
+        if run_ts is None or run_ts >= edit_ts:
+            continue
+        if (edit_ts - run_ts) > window:
+            continue
+        if best is None or run_ts > _parse_iso(best["timestamp"]):
+            best = r
+    return best
+
+
+def _format_tool_trace(tool_calls: list[dict]) -> str:
+    """Compact one-line summary of the tool-call sequence."""
+    counts = {}
+    errors = 0
+    for c in tool_calls or []:
+        counts[c.get("name", "?")] = counts.get(c.get("name", "?"), 0) + 1
+        if c.get("error"):
+            errors += 1
+    parts = []
+    for name in ("search", "fetch", "summarize"):
+        if counts.get(name):
+            parts.append(f"{counts[name]} {name}")
+    if errors:
+        parts.append(f"{errors} error(s)")
+    return " · ".join(parts) if parts else "(no tool calls)"
+
+
+def load_few_shot_examples(
+    n_good: int = 2,
+    n_bad: int = 1,
+    min_records: int = MIN_COMPOSITE_RECORDS,
+) -> dict:
+    """Load few-shot demonstrations from edit_history.jsonl + runs.jsonl.
+
+    Returns:
+      {
+        "ready": bool,                 # True iff >= min_records composite scored
+        "good": [example_dict, ...],   # kept=True, sorted by composite desc
+        "bad": [example_dict, ...],    # kept=False, sorted by composite asc
+        "n_composite_records": int,
+      }
+
+    Demonstrations are GATED behind `min_records` composite-v1 edit_history
+    records (adversarial F3 mitigation — pre-composite labels would teach the
+    old metric's biases).
+    """
+    edit_history_path = storage.LOGS / "edit_history.jsonl"
+    runs_path = storage.LOGS / "runs.jsonl"
+
+    if not edit_history_path.exists():
+        return {"ready": False, "good": [], "bad": [], "n_composite_records": 0}
+
+    edits = []
+    for line in edit_history_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            edits.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+
+    # Filter to composite-scored records only
+    composite_edits = [
+        e for e in edits if e.get("metric_version") == COMPOSITE_METRIC_VERSION
+    ]
+    n = len(composite_edits)
+
+    if n < min_records:
+        return {"ready": False, "good": [], "bad": [], "n_composite_records": n}
+
+    # Load runs.jsonl for timestamp matching
+    runs = []
+    if runs_path.exists():
+        for line in runs_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                runs.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    def _build_example(edit: dict) -> dict | None:
+        run = _find_matching_run(edit, runs)
+        if run is None:
+            return None
+        # Load briefing snippet if path exists
+        briefing_snippet = ""
+        briefing_rel = run.get("briefing_path", "")
+        if briefing_rel:
+            from pathlib import Path
+            bp = Path(briefing_rel)
+            if not bp.is_absolute():
+                bp = storage.ROOT / briefing_rel
+            if bp.exists():
+                text = bp.read_text(encoding="utf-8", errors="replace")
+                briefing_snippet = text[:MAX_DEMO_BRIEFING_CHARS].strip()
+        return {
+            "edit_timestamp": edit.get("timestamp"),
+            "composite_score": edit.get("composite_score") or edit.get("canary_delta"),
+            "breakdown": edit.get("composite_breakdown"),
+            "prompt": (run.get("prompt") or "")[:100],
+            "trace": _format_tool_trace(run.get("tool_calls") or []),
+            "briefing_snippet": briefing_snippet,
+        }
+
+    good_edits = [e for e in composite_edits if e.get("kept") is True]
+    bad_edits = [e for e in composite_edits if e.get("kept") is False]
+
+    good_examples = [ex for ex in (_build_example(e) for e in good_edits) if ex][:n_good]
+    bad_examples = [ex for ex in (_build_example(e) for e in bad_edits) if ex][:n_bad]
+
+    return {
+        "ready": True,
+        "good": good_examples,
+        "bad": bad_examples,
+        "n_composite_records": n,
+    }
+
+
+def demonstrations_block(examples: dict | None = None) -> str:
+    """Render few-shot examples as a markdown block to append to SYSTEM_PROMPT.
+
+    Replaces lessons_block — demonstrations carry more behavioral signal than
+    abstract rules per the strict eval. Empty/not-ready → empty string.
+
+    If `examples` is None, calls load_few_shot_examples() with defaults.
+    """
+    if examples is None:
+        examples = load_few_shot_examples()
+
+    if not examples.get("ready"):
+        return ""
+
+    good = examples.get("good") or []
+    bad = examples.get("bad") or []
+    if not good and not bad:
+        return ""
+
+    lines = ["\n\n## Recent examples (compounded from prior cycles)"]
+
+    if good:
+        lines.append("\n### Good runs (kept after canary)\n")
+        for ex in good:
+            score = ex.get("composite_score")
+            score_str = f"score={score:.2f}" if isinstance(score, (int, float)) else ""
+            lines.append(f"- [{ex.get('edit_timestamp', '?')[:10]} {score_str}]")
+            lines.append(f"  Prompt: {ex.get('prompt', '')!r}")
+            lines.append(f"  Trace: {ex.get('trace', '')}")
+            if ex.get("briefing_snippet"):
+                lines.append(f"  Briefing: {ex['briefing_snippet']!r}")
+
+    if bad:
+        lines.append("\n### Anti-patterns (canary discarded or reverted)\n")
+        for ex in bad:
+            score = ex.get("composite_score")
+            score_str = f"score={score:.2f}" if isinstance(score, (int, float)) else ""
+            lines.append(f"- [{ex.get('edit_timestamp', '?')[:10]} {score_str}]")
+            lines.append(f"  Prompt: {ex.get('prompt', '')!r}")
+            lines.append(f"  Trace: {ex.get('trace', '')}")
+            if ex.get("briefing_snippet"):
+                lines.append(f"  Briefing: {ex['briefing_snippet']!r}")
+
+    return "\n".join(lines) + "\n"
