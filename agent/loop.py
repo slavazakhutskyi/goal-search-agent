@@ -10,7 +10,7 @@ import json
 import time
 from types import ModuleType
 
-from agent import llm, prompts, storage
+from agent import evaluate, llm, prompts, storage
 from agent.tools import fetch, search, summarize
 
 MAX_ITERATIONS = 12  # Originally 8 from first-principles; observed prompt #1 (RapidSOS 7-day)
@@ -52,11 +52,21 @@ def _tool_result_block(tool_use_id: str, content: dict) -> dict:
     }
 
 
-def run(user_prompt: str) -> dict:
-    """Run the agent end-to-end on one user prompt. Returns briefing + trace."""
+def run(user_prompt: str, *, self_eval: bool = True) -> dict:
+    """Run the agent end-to-end on one user prompt. Returns briefing + trace.
+
+    `self_eval=True` (default) runs a self-critique pass after the briefing is
+    saved and appends one line to data/logs/evals.jsonl. The next run reads
+    those lessons and appends them to SYSTEM_PROMPT — that is the compounding
+    feedback loop. Tests pass `self_eval=False` to keep runs deterministic.
+    """
     started = time.time()
     tools = [schema for schema, _ in TOOL_REGISTRY.values()]
     messages: list[dict] = [{"role": "user", "content": user_prompt}]
+
+    # Compounding loop: prepend prior-run lessons to SYSTEM_PROMPT.
+    lessons = evaluate.load_recent_lessons() if self_eval else []
+    system_prompt = prompts.SYSTEM_PROMPT + evaluate.lessons_block(lessons)
 
     tool_calls: list[dict] = []
     last_summarize_briefing: str | None = None  # set after every successful summarize dispatch
@@ -75,7 +85,7 @@ def run(user_prompt: str) -> dict:
                 "model": llm.SONNET_MODEL,
                 "max_tokens": MAX_TOKENS,
                 "tools": tools,
-                "system": prompts.SYSTEM_PROMPT,
+                "system": system_prompt,
                 "messages": messages,
             })
         except Exception as exc:
@@ -201,6 +211,20 @@ def run(user_prompt: str) -> dict:
         tools=len(tool_calls),
     )
 
+    # Self-evaluation pass. Wrapped — eval failure must never break the run.
+    eval_record: dict | None = None
+    if self_eval:
+        try:
+            eval_record = evaluate.run_self_eval(log_entry, briefing_text)
+            evaluate.save_eval(eval_record)
+            storage.log_event(
+                "INFO", "self-eval done",
+                score=eval_record["structure"]["score"],
+                issues=len(eval_record["trace_issues"]),
+            )
+        except Exception as exc:
+            storage.log_event("WARN", "self-eval failed", error=f"{type(exc).__name__}: {exc}")
+
     return {
         "briefing": briefing_text,
         "briefing_path": briefing_path,
@@ -209,4 +233,5 @@ def run(user_prompt: str) -> dict:
         "elapsed_seconds": round(elapsed, 2),
         "tool_call_count": len(tool_calls),
         "tokens": {"input": total_input_tokens, "output": total_output_tokens},
+        "eval": eval_record,
     }
