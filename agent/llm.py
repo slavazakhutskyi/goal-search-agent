@@ -10,9 +10,10 @@ import time
 
 import anthropic
 
-# Hardcoded per spec (D3 — single Sonnet, no provider abstraction).
-# Update here if Anthropic changes the canonical Sonnet ID.
-SONNET_MODEL = "claude-sonnet-4-6"
+# Hardcoded per spec (D3 — single model, no provider abstraction).
+# Swapped to Haiku 2026-05-27 to fit remaining $1.95 budget for live demo.
+# Constant kept as SONNET_MODEL for blast-radius minimization; rename later.
+SONNET_MODEL = "claude-haiku-4-5-20251001"
 
 _client: anthropic.Anthropic | None = None
 

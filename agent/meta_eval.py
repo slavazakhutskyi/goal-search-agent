@@ -28,7 +28,7 @@ from pathlib import Path
 
 from agent import evaluate, llm, storage
 
-SONNET_MODEL = "claude-sonnet-4-6"
+SONNET_MODEL = "claude-haiku-4-5-20251001"  # swapped to Haiku for budget; was claude-sonnet-4-6
 
 
 # Lazy path accessors — must read storage.LOGS / storage.ROOT at call time, not
@@ -762,10 +762,11 @@ def _save_canary(result: dict) -> Path:
 # U8: autonomous() — full hybrid cycle with safety nets
 # ============================================================
 
-# Anthropic Sonnet 4.6 pricing (rough, for budget estimation only — not exact billing).
+# Anthropic Haiku 4.5 pricing (rough, for budget estimation only — not exact billing).
 # Numbers in USD per 1M tokens. Update if Anthropic changes pricing.
-_SONNET_INPUT_PER_1M = 3.00
-_SONNET_OUTPUT_PER_1M = 15.00
+# Swapped from Sonnet 4.6 ($3/$15 per 1M) to Haiku for $1.95 demo budget.
+_SONNET_INPUT_PER_1M = 1.00
+_SONNET_OUTPUT_PER_1M = 5.00
 
 
 def _estimate_cost(tokens_in: int, tokens_out: int) -> float:
