@@ -515,21 +515,42 @@ def _stub_proposal_with_one_edit():
 
 
 def test_autonomous_promotes_when_canary_promotes(temp_data_dir, mocker):
-    """Happy path: propose → canary promote → apply, with prompts.py mutated."""
+    """Happy path: propose → canary promote → apply, with prompts.py mutated.
+
+    Stub uses the U5 composite schema (baseline_composite/candidate_composite/
+    composite_delta + baseline_breakdown/candidate_breakdown). Prior version
+    used the pre-U5 int-delta shape, which made autonomous() silently write
+    None into edit_history.composite_score (review T8/AC-1).
+    """
     fake_path = _fake_prompts_py(temp_data_dir)
     mocker.patch("agent.meta_eval._prompts_py_path", return_value=fake_path)
-    # Stub propose
     mocker.patch("agent.meta_eval.propose_edits", return_value=_stub_proposal_with_one_edit())
-    # Stub run_canary to return promote
+
     def stub_canary(edit, **kw):
         return {
-            "edit_id": edit["id"], "decision": "promote", "reason": "ok",
-            "delta": 1.0, "k_results": [{"baseline_score": 3, "candidate_score": 4, "delta": 1,
-                                          "baseline_tokens": {"input": 1000, "output": 100},
-                                          "candidate_tokens": {"input": 1000, "output": 100}}],
+            "edit_id": edit["id"],
+            "decision": "promote",
+            "reason": "composite improved by +0.200",
+            "delta": 0.20,
+            "baseline_composite": 0.50,
+            "candidate_composite": 0.70,
+            "k": 1,
+            "k_results": [{
+                "iteration": 0,
+                "canary_prompt": "p",
+                "baseline_composite": 0.50,
+                "candidate_composite": 0.70,
+                "composite_delta": 0.20,
+                "baseline_breakdown": {"operator": 0.4, "structure": 1.0, "efficiency": 0.5, "errors": 1.0},
+                "candidate_breakdown": {"operator": 0.8, "structure": 1.0, "efficiency": 0.5, "errors": 1.0},
+                "baseline_tokens": {"input": 1000, "output": 100},
+                "candidate_tokens": {"input": 1000, "output": 100},
+                "baseline_op_tokens": {"input": 200, "output": 100},
+                "candidate_op_tokens": {"input": 200, "output": 100},
+            }],
+            "metric_version": "composite-v1",
         }
     mocker.patch("agent.meta_eval.run_canary", side_effect=stub_canary)
-    # Save fake meta to disk so apply_edit can find E1
     meta_eval._save_meta_eval(_stub_proposal_with_one_edit())
 
     result = meta_eval.autonomous(max_cycles=1, max_cost=10.0)
@@ -538,10 +559,16 @@ def test_autonomous_promotes_when_canary_promotes(temp_data_dir, mocker):
     cycle = result["cycles"][0]
     assert cycle["canary"]["decision"] == "promote"
     assert cycle["apply"]["applied"] is True
-    # edit_history record updated to canary_promoted
+    # edit_history record updated to canary_promoted with new composite fields
     history = meta_eval.load_edit_history()
     assert history[-1]["verdict"] == "canary_promoted"
     assert history[-1]["kept"] is True
+    # New fields per U5 should NOT be None
+    assert history[-1]["composite_score"] == 0.70
+    assert history[-1]["composite_breakdown"] == {
+        "operator": 0.8, "structure": 1.0, "efficiency": 0.5, "errors": 1.0,
+    }
+    assert history[-1]["metric_version"] == "composite-v1"
 
 
 def test_autonomous_halts_on_canary_gate(temp_data_dir, mocker):
@@ -616,6 +643,34 @@ def test_autonomous_halts_on_cost_cap(temp_data_dir, mocker):
     assert "cost_cap" in result["halt_reason"]
 
 
+def test_autonomous_cost_includes_operator_sim_tokens(temp_data_dir, mocker):
+    """Regression test for PERF-001/REL-004: operator_sim Haiku tokens were
+    invisible to the cost cap. Construct a scenario where the replay tokens
+    alone don't breach max_cost but the op_tokens push it over."""
+    fake_path = _fake_prompts_py(temp_data_dir)
+    mocker.patch("agent.meta_eval._prompts_py_path", return_value=fake_path)
+    mocker.patch("agent.meta_eval.propose_edits", return_value=_stub_proposal_with_one_edit())
+    # Tiny replay tokens — would NOT trip cost-cap alone.
+    # Large op_tokens — DO push the total past the cap.
+    mocker.patch("agent.meta_eval.run_canary", return_value={
+        "edit_id": "E1", "decision": "promote", "reason": "ok", "delta": 1.0,
+        "k_results": [{
+            "baseline_tokens": {"input": 100, "output": 10},
+            "candidate_tokens": {"input": 100, "output": 10},
+            # 2M total Haiku tokens — at $1/$5 per 1M, ~$8 cost. Way over $0.10.
+            "baseline_op_tokens": {"input": 1_000_000, "output": 500_000},
+            "candidate_op_tokens": {"input": 1_000_000, "output": 500_000},
+        }],
+    })
+    meta_eval._save_meta_eval(_stub_proposal_with_one_edit())
+
+    result = meta_eval.autonomous(max_cycles=3, max_cost=0.10)
+    # Second cycle pre-check halts because op_tokens now count toward total
+    assert "cost_cap" in result["halt_reason"]
+    # Verify the operator-sim tokens were actually counted (cost > $0.10)
+    assert result["total_cost_estimate"] > 0.10
+
+
 def test_autonomous_convergence_when_no_valid_edits(temp_data_dir, mocker):
     fake_path = _fake_prompts_py(temp_data_dir)
     mocker.patch("agent.meta_eval._prompts_py_path", return_value=fake_path)
@@ -643,3 +698,48 @@ def test_autonomous_writes_audit_log(temp_data_dir, mocker):
 
 # Import Path for the test above
 from pathlib import Path
+
+
+# ---------- status() — agent-native CLI surface ----------
+
+def test_status_exposes_demonstrations_readiness(temp_data_dir):
+    """Agent-native gap fix (M-03): status() must expose whether the
+    demonstrations layer is firing, not just legacy recent_lessons.
+
+    Previously status only returned recent_lessons (lessons-block format),
+    which loop.py no longer uses. The dashboard was showing stale data while
+    the system actually uses demonstrations_block.
+    """
+    result = meta_eval.status()
+    # New fields must be present (even when no composite records exist)
+    assert "demonstrations_ready" in result
+    assert "n_composite_records" in result
+    assert "n_good_examples" in result
+    assert "n_bad_examples" in result
+    # With empty edit_history, demonstrations are NOT ready
+    assert result["demonstrations_ready"] is False
+    assert result["n_composite_records"] == 0
+    # Legacy field still present for backward compat
+    assert "recent_lessons" in result
+
+
+def test_score_cli_verb(temp_data_dir, monkeypatch, capsys, tmp_path):
+    """Agent-native gap fix: python -m agent.meta_eval score <briefing>
+    must score a single briefing offline without firing canary infrastructure."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")  # force no-llm path; deterministic
+    briefing_path = tmp_path / "test_briefing.md"
+    briefing_path.write_text(
+        "# Briefing — Test\n\n## TL;DR\nThings happened.\n\n"
+        "## Key themes\n- A [^1]\n- B [^2]\n- C [^3]\n\n"
+        "## Sentiment\n**Neutral** — ok.\n\n## Sources\n[^1]: [A](u)\n"
+    )
+
+    exit_code = meta_eval.main(["score", str(briefing_path)])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    # Output should be JSON with structure + operator_sim + composite
+    out = json.loads(captured.out)
+    assert "structure" in out
+    assert "operator_sim" in out
+    assert "composite" in out
+    assert "composite" in out["composite"]  # nested: composite_score returns {composite, breakdown, ...}

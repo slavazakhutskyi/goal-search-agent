@@ -4,15 +4,18 @@
 2. Trace critique — scan tool_calls for known anti-patterns from runs.jsonl.
 3. LLM judge — one Haiku call for usefulness + next-run suggestion.
 
-Output appended to `data/logs/evals.jsonl`. Lessons feed back into the
-SYSTEM_PROMPT on subsequent runs via `load_recent_lessons()` — that is the
-compounding loop: the agent reads its own critique and adjusts.
+Output appended to `data/logs/evals.jsonl`. Compounding works via
+`demonstrations_block()` (U3): few-shot examples from kept/reverted edits
+gated behind metric_version=composite-v1 records. The legacy
+`load_recent_lessons()` is preserved for backward compat but no longer the
+primary compounding mechanism.
 """
 
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from agent import llm, storage
 
@@ -77,10 +80,17 @@ def critique_trace(run_log: dict) -> list[dict]:
     if summarize_errors:
         bad_args = [c for c in summarize_errors if "missing" in (c.get("error") or "") and "documents" in (c.get("error") or "")]
         if bad_args:
+            # Suggestion updated post-U0 (review AC-3): the new tool contract
+            # has `documents` as OPTIONAL — the loop auto-attaches. If the
+            # `missing documents` error still fires after U0, it means the
+            # auto-attach hook itself failed (not a model-side prompting
+            # issue). Don't suggest re-enforcing the old required-documents
+            # contract — that would create a self-defeating feedback loop
+            # where meta-eval proposes SYSTEM_PROMPT edits to undo U0.
             issues.append({
                 "tag": "summarize_missing_documents",
                 "detail": f"summarize called {len(bad_args)} time(s) without `documents` arg",
-                "suggestion": "Call summarize with BOTH prompt and documents — pass the full list of fetched document dicts as `documents`.",
+                "suggestion": "Investigate why the loop's auto-attach hook (loop._collect_fetched_docs) did not inject documents. This is a code path issue, not a prompting issue — `documents` is OPTIONAL per the current tool schema.",
             })
 
     search_count = sum(1 for c in calls if c["name"] == "search")
@@ -249,7 +259,6 @@ MAX_TIMESTAMP_WINDOW_HOURS = 24
 
 def _parse_iso(ts: str):
     """Parse ISO 8601 timestamp, returning None on failure."""
-    from datetime import datetime
     if not ts:
         return None
     try:
@@ -264,7 +273,6 @@ def _find_matching_run(edit_record: dict, runs: list[dict]) -> dict | None:
     record's timestamp, within MAX_TIMESTAMP_WINDOW_HOURS. This is the run
     whose eval triggered the edit proposal.
     """
-    from datetime import timedelta
     edit_ts = _parse_iso(edit_record.get("timestamp", ""))
     if edit_ts is None:
         return None
@@ -362,7 +370,6 @@ def load_few_shot_examples(
         briefing_snippet = ""
         briefing_rel = run.get("briefing_path", "")
         if briefing_rel:
-            from pathlib import Path
             bp = Path(briefing_rel)
             if not bp.is_absolute():
                 bp = storage.ROOT / briefing_rel
@@ -380,6 +387,12 @@ def load_few_shot_examples(
 
     good_edits = [e for e in composite_edits if e.get("kept") is True]
     bad_edits = [e for e in composite_edits if e.get("kept") is False]
+
+    # Sort by composite_score: good descending (highest-scoring exemplars
+    # first), bad ascending (worst regressions first). The docstring claims
+    # this; previously the slice took whatever order was on disk. (Review M-09.)
+    good_edits.sort(key=lambda e: e.get("composite_score") or 0.0, reverse=True)
+    bad_edits.sort(key=lambda e: e.get("composite_score") or 1.0)
 
     good_examples = [ex for ex in (_build_example(e) for e in good_edits) if ex][:n_good]
     bad_examples = [ex for ex in (_build_example(e) for e in bad_edits) if ex][:n_bad]

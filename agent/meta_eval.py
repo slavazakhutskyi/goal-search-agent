@@ -30,6 +30,33 @@ from agent import evaluate, llm, storage
 
 SONNET_MODEL = "claude-haiku-4-5-20251001"  # swapped to Haiku for budget; was claude-sonnet-4-6
 
+# Single source of truth for the metric_version tag. Re-exported from
+# evaluate.COMPOSITE_METRIC_VERSION so a future bump touches one constant.
+# (Code review M-10/AC-4 — was hardcoded in 4 places.)
+def _metric_version() -> str:
+    from agent import evaluate as _eval
+    return _eval.COMPOSITE_METRIC_VERSION
+
+
+def _count_replay_errors(run_result: dict) -> int:
+    """Count tool-call errors in a replay run. Used by run_canary to wire the
+    errors component of the composite verdict (fixes the dead-code bug from
+    review M-04/REL-003/C3 where the previous expression always evaluated to
+    an empty list)."""
+    # replay_run returns the same shape as loop.run; tool_calls live in the
+    # run record on disk. The in-memory return dict carries tool_call_count
+    # but not the full tool_calls list, so we approximate: any non-complete
+    # status counts as 1 error, and partial_* statuses count higher. Replay
+    # is too cheap to round-trip through disk just for an exact error count.
+    status = run_result.get("status", "")
+    if status == "complete":
+        return 0
+    if status == "partial_empty_response":
+        return 2  # severe
+    if status.startswith("partial_"):
+        return 1
+    return 1  # unknown non-complete status
+
 
 # Lazy path accessors — must read storage.LOGS / storage.ROOT at call time, not
 # import time, because the temp_data_dir fixture monkey-patches those globals
@@ -501,7 +528,7 @@ def apply_edit(edit_id: str, *, yes: bool = False) -> dict:
         "before_score": None,
         "after_score": None,
         "kept": None,
-        "metric_version": "composite-v1",  # U3: tags this record for demonstrations eligibility
+        "metric_version": _metric_version(),  # U3: tags this record for demonstrations eligibility
     }
     record_edit_attempt(record)
 
@@ -635,14 +662,32 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
         canary_prompt: historical prompt to replay; auto-selected if None
         canary_urls: cached URLs to constrain replay; auto-selected if None
 
-    Returns:
+    Returns (current shape post-U5 composite migration):
         {
           "edit_id": str,
+          "edit_type": str,
           "decision": "promote|discard|gate",
-          "baseline_score": int, "candidate_score": int, "delta": int,
-          "k_results": [{prompt, baseline_score, candidate_score, delta}, ...],
           "reason": str,
-          "saved_to": str,
+          "delta": float,                       # avg composite_delta across K
+          "baseline_composite": float,          # avg baseline composite across K
+          "candidate_composite": float,         # avg candidate composite across K
+          "k": int,
+          "k_results": [
+            {
+              "iteration": int,
+              "canary_prompt": str,
+              "baseline_composite": float,
+              "candidate_composite": float,
+              "composite_delta": float,
+              "baseline_breakdown": {operator, structure, efficiency, errors},
+              "candidate_breakdown": {operator, structure, efficiency, errors},
+              "baseline_status": str, "candidate_status": str,
+              "baseline_tokens": dict, "candidate_tokens": dict,
+              "baseline_op_tokens": dict, "candidate_op_tokens": dict,
+            },
+            ...
+          ],
+          "metric_version": "composite-v1",
         }
     """
     from agent import evaluate as _eval, replay as _replay, prompts as _prompts_mod
@@ -711,20 +756,28 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
         baseline_op = _opsim.coverage_score(canary_prompt, baseline_brief)
         candidate_op = _opsim.coverage_score(canary_prompt, candidate_brief)
 
-        # Build minimal eval_records for composite scoring
+        # Trace issues from each replay run. Fixes the dead-code bug flagged
+        # by 5 reviewers: the previous expression `[... for c in (x and [] or [])]`
+        # always evaluated to [] regardless of x, so the errors component of
+        # the composite was permanently 1.0 (silently dead 10% weight).
+        # Now we surface real summarize/fetch failures from the replay traces.
+        baseline_errors = _count_replay_errors(baseline_run)
+        candidate_errors = _count_replay_errors(candidate_run)
+
+        # Build minimal eval_records for composite scoring. trace_issues is a
+        # list whose LENGTH is what composite_score consumes (n_errors), so a
+        # list of N placeholder dicts is the right shape.
         baseline_eval = {
             "operator_sim": baseline_op,
             "structure": baseline_struct,
             "tokens": baseline_run.get("tokens"),
-            "trace_issues": [
-                {"tag": "error"} for c in (baseline_run.get("tool_call_count") and [] or [])
-            ],  # token-count proxy until we surface real trace issues from replays
+            "trace_issues": [{"tag": "replay_error"} for _ in range(baseline_errors)],
         }
         candidate_eval = {
             "operator_sim": candidate_op,
             "structure": candidate_struct,
             "tokens": candidate_run.get("tokens"),
-            "trace_issues": [],
+            "trace_issues": [{"tag": "replay_error"} for _ in range(candidate_errors)],
         }
 
         baseline_composite = _opsim.composite_score(baseline_eval)
@@ -744,6 +797,12 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
             "candidate_status": candidate_run.get("status"),
             "baseline_tokens": baseline_run.get("tokens"),
             "candidate_tokens": candidate_run.get("tokens"),
+            # Operator-sim Haiku tokens (review PERF-001/REL-004 fix). Without
+            # these, autonomous() cost-cap accounting silently undercounts by
+            # ~$0.01 per canary iteration; at K>=3 and multi-cycle runs that
+            # accumulates past the budget threshold.
+            "baseline_op_tokens": baseline_op.get("tokens"),
+            "candidate_op_tokens": candidate_op.get("tokens"),
         })
 
     # 5. Classify via composite delta (averaged across K)
@@ -762,7 +821,7 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
         "candidate_composite": round(avg_candidate, 4),
         "k": k,
         "k_results": k_results,
-        "metric_version": "composite-v1",  # marks this record for U3 demonstrations gate
+        "metric_version": _metric_version(),  # marks this record for U3 demonstrations gate
     }
     _save_canary(result)
     return result
@@ -924,9 +983,14 @@ def autonomous(*, max_cycles: int = 3, max_cost: float = 0.50,
             "reason": canary_result["reason"],
             "delta": canary_result.get("delta"),
         }
-        # Accumulate canary cost
+        # Accumulate canary cost. Includes BOTH the full-loop replay tokens
+        # AND the operator_sim Haiku tokens (per code review PERF-001/REL-004
+        # — previously the op_tokens were invisible to the cost cap).
         for kr in canary_result.get("k_results") or []:
-            for which in ("baseline_tokens", "candidate_tokens"):
+            for which in (
+                "baseline_tokens", "candidate_tokens",
+                "baseline_op_tokens", "candidate_op_tokens",
+            ):
                 tk = kr.get(which) or {}
                 total_cost += _estimate_cost(tk.get("input", 0), tk.get("output", 0))
 
@@ -945,9 +1009,7 @@ def autonomous(*, max_cycles: int = 3, max_cost: float = 0.50,
                     hist[-1]["composite_breakdown"] = (
                         canary_result.get("k_results") or [{}]
                     )[0].get("candidate_breakdown")
-                    # metric_version already set on the pending record by apply_edit;
-                    # this defensively re-sets it in case apply_edit was patched
-                    hist[-1]["metric_version"] = "composite-v1"
+                    hist[-1]["metric_version"] = _metric_version()
                     _rewrite_edit_history(hist)
                 consecutive_regressions = 0
                 cycle["events"].append({"result": "promoted"})
@@ -976,7 +1038,7 @@ def autonomous(*, max_cycles: int = 3, max_cost: float = 0.50,
                 "composite_score": canary_result.get("candidate_composite"),
                 "composite_breakdown": (canary_result.get("k_results") or [{}])[0].get("candidate_breakdown"),
                 "kept": False,
-                "metric_version": "composite-v1",
+                "metric_version": _metric_version(),
             })
             consecutive_regressions += 1
             cycle["events"].append({"result": "discarded"})
@@ -1121,22 +1183,34 @@ def compare(prompt_substring: str) -> dict:
 
 
 # ============================================================
-# U4: CLI entry — python -m agent.meta_eval <verb>
+# CLI entry — python -m agent.meta_eval <verb>
 # ============================================================
 
 def status() -> dict:
-    """Print/return a dashboard: trailing edit + recent lessons + last meta-eval."""
+    """Print/return a dashboard: trailing edit + demonstrations state + last meta-eval.
+
+    Reports both the legacy `recent_lessons` (for backward compat) AND the new
+    `demonstrations_*` fields. The demonstrations layer is gated behind
+    MIN_COMPOSITE_RECORDS records of metric_version composite-v1; surfacing
+    readiness + count lets the user see why SYSTEM_PROMPT isn't getting demos
+    yet during the bootstrap window. (Code review M-03 + agent-native gap.)
+    """
     history = load_edit_history()
     trailing = history[-1] if history else None
     last_meta = load_last_meta_eval()
     from agent import evaluate as _eval
     lessons = _eval.load_recent_lessons()
+    demos = _eval.load_few_shot_examples()
     return {
         "trailing_edit": trailing,
         "history_count": len(history),
         "last_meta_eval_ts": (last_meta or {}).get("timestamp"),
         "last_meta_eval_n_edits": len((last_meta or {}).get("proposed_edits") or []),
-        "recent_lessons": lessons,
+        "recent_lessons": lessons,  # legacy
+        "demonstrations_ready": demos.get("ready", False),
+        "n_composite_records": demos.get("n_composite_records", 0),
+        "n_good_examples": len(demos.get("good") or []),
+        "n_bad_examples": len(demos.get("bad") or []),
     }
 
 
@@ -1152,7 +1226,12 @@ Verbs:
                                 score the delta + write a comparison report.
   keep [--note TEXT]            Mark trailing edit_history record kept=true.
   revert [--note TEXT]          Restore prompts.py from snapshot; mark kept=false.
-  status                        Dashboard: trailing edit, recent lessons, last meta-eval.
+  status                        Dashboard: trailing edit, demonstrations
+                                readiness, last meta-eval.
+  score <briefing_path>         Run operator_sim + composite_score on a single
+                                briefing (offline debugging — no canary, no
+                                replay). --prompt PROMPT for the user prompt
+                                (defaults to the briefing's title line).
   autonomous [--max-cycles N] [--max-cost N] [--canary-k N]
                                 Run hybrid cycle: propose → canary → act.
                                 Halts on cost cap, cycle cap, consecutive regressions,
@@ -1227,6 +1306,49 @@ def main(argv: list[str] | None = None) -> int:
 
     if verb == "status":
         result = status()
+        print(json.dumps(result, indent=2, default=str))
+        return 0
+
+    if verb == "score":
+        if not rest:
+            sys.stderr.write("score: missing <briefing_path>\n")
+            return 2
+        briefing_path = Path(rest[0])
+        if not briefing_path.exists():
+            sys.stderr.write(f"score: briefing not found at {briefing_path}\n")
+            return 2
+        briefing_text = briefing_path.read_text(encoding="utf-8")
+        prompt = None
+        if "--prompt" in rest:
+            i = rest.index("--prompt")
+            if i + 1 < len(rest):
+                prompt = rest[i + 1]
+        if prompt is None:
+            # Default: extract first H1 line if present, else first non-empty line
+            for line in briefing_text.splitlines():
+                line = line.strip()
+                if line.startswith("# "):
+                    prompt = line[2:].lstrip("Briefing — ")
+                    break
+                if line and not line.startswith("#"):
+                    prompt = line[:120]
+                    break
+            if prompt is None:
+                prompt = "(unknown prompt)"
+        from agent import evaluate as _eval, operator_sim as _opsim
+        op = _opsim.coverage_score(prompt, briefing_text)
+        struct = _eval.check_structure(briefing_text)
+        composite = _opsim.composite_score({
+            "operator_sim": op,
+            "structure": struct,
+        })
+        result = {
+            "briefing_path": str(briefing_path),
+            "prompt": prompt,
+            "structure": struct,
+            "operator_sim": op,
+            "composite": composite,
+        }
         print(json.dumps(result, indent=2, default=str))
         return 0
 

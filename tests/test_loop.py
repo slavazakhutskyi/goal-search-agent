@@ -86,6 +86,79 @@ def test_loop_auto_attaches_documents_when_summarize_omits_them(
     assert urls == {"https://a.example", "https://b.example"}
 
 
+def test_loop_auto_attaches_when_model_passes_empty_documents(
+    mocker, mock_llm_queue, temp_data_dir
+):
+    """U0 (C1 fix): model passing `documents=[]` is semantically equivalent
+    to omitting the key — auto-attach must still fire.
+
+    The original guard `"documents" not in tool_input` missed this case; the
+    model would get an empty-docs stub briefing instead of the fetched docs.
+    Truthiness check (`not tool_input.get("documents")`) closes the gap.
+    """
+    from agent import storage
+
+    storage.save_fetched("https://x.example", {
+        "url": "https://x.example", "text": "x content",
+        "metadata": {"title": "X", "source_domain": "x.example"},
+    })
+
+    summarize_spy = mocker.patch(
+        "agent.tools.summarize.run", return_value={"briefing": CANNED_BRIEFING}
+    )
+    mocker.patch(
+        "agent.tools.fetch.run",
+        side_effect=lambda url: storage.load_fetched(url) or {"error": "miss"},
+    )
+
+    mock_llm_queue.extend([
+        make_response([make_tool_use_block("t1", "fetch", {"url": "https://x.example"})]),
+        # Model passes EMPTY documents list — was a footgun in the original guard
+        make_response([make_tool_use_block("t2", "summarize", {"prompt": "test", "documents": []})]),
+        make_response([make_text_block("Done.")]),
+    ])
+
+    loop.run("Test prompt")
+
+    call_args = summarize_spy.call_args
+    docs = call_args.kwargs.get("documents") or (call_args.args[1] if len(call_args.args) > 1 else None)
+    # Auto-attach should have fired and replaced the empty list
+    assert docs is not None and len(docs) == 1
+    assert docs[0]["url"] == "https://x.example"
+
+
+def test_loop_auto_attaches_when_model_passes_none_documents(
+    mocker, mock_llm_queue, temp_data_dir
+):
+    """U0 (C1 fix): model passing `documents=None` must also trigger auto-attach."""
+    from agent import storage
+
+    storage.save_fetched("https://x.example", {
+        "url": "https://x.example", "text": "x",
+        "metadata": {"title": "X", "source_domain": "x.example"},
+    })
+
+    summarize_spy = mocker.patch(
+        "agent.tools.summarize.run", return_value={"briefing": CANNED_BRIEFING}
+    )
+    mocker.patch(
+        "agent.tools.fetch.run",
+        side_effect=lambda url: storage.load_fetched(url) or {"error": "miss"},
+    )
+
+    mock_llm_queue.extend([
+        make_response([make_tool_use_block("t1", "fetch", {"url": "https://x.example"})]),
+        make_response([make_tool_use_block("t2", "summarize", {"prompt": "test", "documents": None})]),
+        make_response([make_text_block("Done.")]),
+    ])
+
+    loop.run("Test prompt")
+
+    call_args = summarize_spy.call_args
+    docs = call_args.kwargs.get("documents") or (call_args.args[1] if len(call_args.args) > 1 else None)
+    assert docs is not None and len(docs) == 1
+
+
 def test_loop_does_not_auto_attach_when_model_passes_documents(
     mocker, mock_llm_queue, temp_data_dir
 ):

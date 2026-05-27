@@ -46,7 +46,17 @@ MIN_BRIEFING_LEN = 100
 
 # Token normalization: divide raw token delta by this to land in [-1, 1] ish.
 # 50k = the rough scale of a single full agent run's input tokens.
-_TOKEN_NORM = 50_000
+TOKEN_NORM = 50_000
+
+# Cache size cap. Prevents unbounded growth in long-running processes; FIFO
+# eviction is sufficient for the typical canary workload (a handful of
+# distinct briefings per session).
+MAX_CACHE_SIZE = 256
+
+# Expected number of operator follow-up questions. Coverage denominator is
+# FIXED at this — never derived from LLM response length — so LLM verbosity
+# (returning 4 or 7 items) cannot drift the metric off-contract.
+EXPECTED_QUESTIONS = 5
 
 
 _coverage_cache: dict[str, dict] = {}
@@ -79,9 +89,15 @@ Coverage MUST equal (count of answered=true AND citations non-empty) / 5.
 """
 
 
-def _hash_briefing(briefing: str) -> str:
-    """Cache key for coverage_score results."""
-    return hashlib.sha256(briefing.encode("utf-8")).hexdigest()[:16]
+def _cache_key(prompt: str, briefing: str) -> str:
+    """Cache key includes BOTH prompt and briefing. The operator's follow-up
+    questions are derived from the prompt; two different prompts on the same
+    briefing must produce different question sets and therefore different
+    coverage scores. Hashing only the briefing (the previous bug) returned
+    stale answers for any compare()/multi-prompt canary workflow.
+    """
+    combined = f"{prompt}\x00{briefing}".encode("utf-8")
+    return hashlib.sha256(combined).hexdigest()[:16]
 
 
 def coverage_score(prompt: str, briefing: str, *, use_llm: bool = True) -> dict:
@@ -108,7 +124,7 @@ def coverage_score(prompt: str, briefing: str, *, use_llm: bool = True) -> dict:
             "skip_reason": "briefing too short",
         }
 
-    cache_key = _hash_briefing(briefing)
+    cache_key = _cache_key(prompt, briefing)
     if cache_key in _coverage_cache:
         cached = dict(_coverage_cache[cache_key])
         cached["cached"] = True
@@ -129,13 +145,30 @@ def coverage_score(prompt: str, briefing: str, *, use_llm: bool = True) -> dict:
         briefing=briefing[:8000],
     )
 
+    # Narrow exception handling — match the convention in agent/tools/search.py
+    # and agent/tools/fetch.py: graceful error dict, never raise. Keep a final
+    # broad except as a safety net but typed errors get prioritized handling.
     try:
         response = llm.call_with_retry({
             "model": HAIKU_MODEL,
             "max_tokens": 1024,
             "messages": [{"role": "user", "content": user_message}],
         })
-    except Exception as exc:
+    except (RuntimeError, ValueError) as exc:
+        # RuntimeError covers the typed "ANTHROPIC_API_KEY not set" from llm.client.
+        # ValueError covers bad-input cases (malformed kwargs).
+        return {
+            "coverage": 0.0,
+            "questions": [],
+            "answered": [],
+            "citations": [],
+            "cached": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    except Exception as exc:  # pragma: no cover — anthropic transient/network errors
+        # llm.call_with_retry already retries rate-limit/timeout/connection. If we
+        # land here, retries were exhausted. Surface as error dict so the canary
+        # can record the failure without crashing the autonomous loop.
         return {
             "coverage": 0.0,
             "questions": [],
@@ -162,15 +195,29 @@ def coverage_score(prompt: str, briefing: str, *, use_llm: bool = True) -> dict:
 
     # Defensive normalization: recompute coverage from answered+citations
     # to defeat the case where the LLM lies about its own coverage field.
+    # Denominator is FIXED at EXPECTED_QUESTIONS (5) — not derived from the
+    # response — so LLM verbosity (returning 4 or 7 items) cannot drift the
+    # metric off-contract. Extra items past 5 are ignored; missing items count
+    # as unanswered.
     answered = parsed.get("answered") or []
     citations = parsed.get("citations") or []
-    n = max(len(answered), len(citations), 5)
     grounded = sum(
         1
-        for i in range(min(len(answered), len(citations)))
+        for i in range(min(len(answered), len(citations), EXPECTED_QUESTIONS))
         if answered[i] and (citations[i] or "").strip()
     )
-    coverage = grounded / n if n else 0.0
+    coverage = grounded / EXPECTED_QUESTIONS
+
+    # Capture Haiku token usage so callers (run_canary, autonomous cost-cap)
+    # can include operator_sim's API cost in their accounting. Without this,
+    # autonomous() silently undercounts by ~$0.01 per canary call.
+    usage = getattr(response, "usage", None)
+    tokens = None
+    if usage is not None:
+        tokens = {
+            "input": getattr(usage, "input_tokens", 0),
+            "output": getattr(usage, "output_tokens", 0),
+        }
 
     result = {
         "coverage": round(coverage, 4),
@@ -178,8 +225,17 @@ def coverage_score(prompt: str, briefing: str, *, use_llm: bool = True) -> dict:
         "answered": answered,
         "citations": citations,
         "reported_coverage": parsed.get("coverage"),
+        "tokens": tokens,
         "cached": False,
     }
+    # FIFO eviction when over the cap. Simple and bounded.
+    if len(_coverage_cache) >= MAX_CACHE_SIZE:
+        # Drop oldest entry. Dicts preserve insertion order in Python 3.7+.
+        try:
+            oldest = next(iter(_coverage_cache))
+            del _coverage_cache[oldest]
+        except StopIteration:
+            pass
     _coverage_cache[cache_key] = result
     return result
 
@@ -213,7 +269,7 @@ def composite_score(eval_record: dict, weights: dict | None = None) -> dict:
     if total_tokens <= 0:
         breakdown["efficiency"] = 0.5
     else:
-        breakdown["efficiency"] = max(0.0, min(1.0, 1.0 - total_tokens / (2 * _TOKEN_NORM)))
+        breakdown["efficiency"] = max(0.0, min(1.0, 1.0 - total_tokens / (2 * TOKEN_NORM)))
 
     # Errors: 0 errors = perfect; 1 = penalized; ≥3 = floored
     n_errors = len(eval_record.get("trace_issues") or [])
@@ -233,19 +289,11 @@ def composite_score(eval_record: dict, weights: dict | None = None) -> dict:
     }
 
 
-def classify_composite(baseline_composite: float, candidate_composite: float) -> tuple[str, str]:
-    """Deterministic verdict from composite deltas.
-
-    Returns (decision, reason). Delta is rounded to 4 decimals before
-    comparison so float-arithmetic edge cases (0.55 - 0.5 == 0.05000…04)
-    don't push borderline cases across the threshold.
-    """
-    delta = round(candidate_composite - baseline_composite, 4)
-    if delta > PROMOTE_DELTA:
-        return "promote", f"composite improved by {delta:+.3f} (threshold {PROMOTE_DELTA})"
-    if delta < DISCARD_DELTA:
-        return "discard", f"composite regressed by {delta:+.3f} (threshold {DISCARD_DELTA})"
-    return "gate", f"composite delta {delta:+.3f} within noise band ({DISCARD_DELTA}, {PROMOTE_DELTA}]"
+# classify_composite was a parallel implementation of meta_eval.classify_canary.
+# Deleted per code review M-02/AC-6 — production canary always calls
+# meta_eval.classify_canary (which handles type=delete override, empty-K guard,
+# and K-averaging). A standalone two-arg classifier here would silently drift
+# from the canary's actual decision logic. Use classify_canary directly.
 
 
 def reset_cache() -> None:

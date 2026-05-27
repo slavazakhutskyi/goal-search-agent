@@ -325,3 +325,61 @@ def test_demonstrations_block_renders_good_and_bad(temp_data_dir):
     assert "good prompt" in block
     assert "bad prompt" in block
     assert "1 search · 2 fetch · 1 summarize" in block
+
+
+def test_load_few_shot_examples_sorts_by_composite_score(temp_data_dir):
+    """M-09 regression: good examples sorted by composite_score DESC, bad ASC.
+
+    Previously the slice took whatever order was on disk, so few-shot examples
+    were the most-recent kept/reverted edits — NOT the highest-scoring exemplars
+    or worst regressions the docstring claims.
+    """
+    _write_runs(temp_data_dir, [
+        {"timestamp": "2026-05-26T09:00:00+00:00", "prompt": "low good", "tool_calls": [],
+         "briefing_path": "data/briefings/x1.md"},
+        {"timestamp": "2026-05-26T10:00:00+00:00", "prompt": "high good", "tool_calls": [],
+         "briefing_path": "data/briefings/x2.md"},
+        {"timestamp": "2026-05-26T11:00:00+00:00", "prompt": "mild bad", "tool_calls": [],
+         "briefing_path": "data/briefings/x3.md"},
+        {"timestamp": "2026-05-26T12:00:00+00:00", "prompt": "severe bad", "tool_calls": [],
+         "briefing_path": "data/briefings/x4.md"},
+    ])
+    # 4 composite-v1 records. Good in mixed order (low first, then high) and
+    # bad in mixed order (mild first, then severe). After sort, top good should
+    # be "high good" and top bad should be "severe bad".
+    _write_edit_history(temp_data_dir, [
+        {"timestamp": "2026-05-26T09:30:00+00:00", "kept": True,
+         "metric_version": "composite-v1", "composite_score": 0.55},
+        {"timestamp": "2026-05-26T10:30:00+00:00", "kept": True,
+         "metric_version": "composite-v1", "composite_score": 0.85},
+        {"timestamp": "2026-05-26T11:30:00+00:00", "kept": False,
+         "metric_version": "composite-v1", "composite_score": 0.40},
+        {"timestamp": "2026-05-26T12:30:00+00:00", "kept": False,
+         "metric_version": "composite-v1", "composite_score": 0.10},
+    ])
+    out = evaluate.load_few_shot_examples(n_good=1, n_bad=1)
+    assert out["ready"] is True
+    # Top good should be the 0.85 scorer ("high good"), not the chronologically-first
+    assert out["good"][0]["prompt"] == "high good"
+    # Top bad should be the 0.10 scorer ("severe bad"), worst regression first
+    assert out["bad"][0]["prompt"] == "severe bad"
+
+
+def test_evaluate_trace_critique_suggestion_does_not_recommend_old_contract(temp_data_dir):
+    """AC-3 regression: the summarize_missing_documents suggestion must NOT
+    recommend re-enforcing the old required-documents contract, since U0 made
+    documents optional. Otherwise meta-eval can propose SYSTEM_PROMPT edits
+    that undo U0 — a self-defeating feedback loop."""
+    run_log = {
+        "tool_calls": [
+            {"name": "summarize", "error": "bad tool input for summarize: run() missing 1 required positional argument: 'documents'"},
+        ],
+    }
+    issues = evaluate.critique_trace(run_log)
+    smd = next((i for i in issues if i["tag"] == "summarize_missing_documents"), None)
+    assert smd is not None
+    # The suggestion text must NOT instruct the model to "pass documents"
+    suggestion = smd["suggestion"].lower()
+    assert "both prompt and documents" not in suggestion
+    # And it SHOULD reference the auto-attach hook as the actual fix surface
+    assert "auto-attach" in suggestion or "loop" in suggestion

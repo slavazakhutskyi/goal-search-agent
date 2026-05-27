@@ -158,7 +158,13 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
             # inject all successfully-fetched docs from this run before dispatch.
             # Eliminates the summarize_missing_documents failure pattern that
             # fired in 6 of 7 historical runs.
-            if tool_use.name == "summarize" and "documents" not in tool_input:
+            #
+            # Use `not tool_input.get("documents")` (truthiness) rather than
+            # `"documents" not in tool_input` (key presence): the model can
+            # legitimately omit the key, pass `documents=None`, or pass an
+            # empty list. All three should trigger auto-attach; only the
+            # key-omission case is caught by the presence check.
+            if tool_use.name == "summarize" and not tool_input.get("documents"):
                 tool_input["documents"] = _collect_fetched_docs(tool_calls)
             result = _dispatch_tool(tool_use.name, tool_input)
             tool_elapsed = round(time.time() - tool_started, 2)
@@ -169,7 +175,11 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
             # auto-attach we collapse the docs to a count so the log stays
             # compact and the URL list isn't duplicated from fetch records.
             recorded_input = dict(tool_use.input)
-            if tool_use.name == "summarize" and "documents" not in tool_use.input and "documents" in tool_input:
+            if (
+                tool_use.name == "summarize"
+                and not tool_use.input.get("documents")
+                and tool_input.get("documents")
+            ):
                 recorded_input["_auto_attached_docs"] = len(tool_input["documents"])
             tool_calls.append({
                 "iteration": iteration,

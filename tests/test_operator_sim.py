@@ -80,7 +80,7 @@ def test_coverage_groundedness_overrides_yes_without_citation(mocker, temp_data_
     assert out["coverage"] == 0.2
 
 
-def test_coverage_caches_by_briefing(mocker, temp_data_dir, monkeypatch):
+def test_coverage_caches_by_prompt_and_briefing(mocker, temp_data_dir, monkeypatch):
     operator_sim.reset_cache()
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
     spy = mocker.patch(
@@ -93,8 +93,67 @@ def test_coverage_caches_by_briefing(mocker, temp_data_dir, monkeypatch):
         }),
     )
     operator_sim.coverage_score("p", GOOD_BRIEFING)
-    operator_sim.coverage_score("p", GOOD_BRIEFING)  # second call hits cache
+    operator_sim.coverage_score("p", GOOD_BRIEFING)  # same prompt + briefing → cache hit
     assert spy.call_count == 1
+
+
+def test_coverage_cache_keys_on_prompt_too(mocker, temp_data_dir, monkeypatch):
+    """Different prompts on the SAME briefing must miss the cache.
+
+    The operator's follow-up questions depend on the prompt, not just the
+    briefing. Hashing only the briefing returns stale answers for
+    compare()/multi-prompt canary workflows.
+    """
+    operator_sim.reset_cache()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    spy = mocker.patch(
+        "agent.operator_sim.llm.call_with_retry",
+        return_value=_stub_response({
+            "questions": ["q"] * 5,
+            "answered": [True] * 5,
+            "citations": ["[^1]"] * 5,
+            "coverage": 1.0,
+        }),
+    )
+    operator_sim.coverage_score("prompt A", GOOD_BRIEFING)
+    operator_sim.coverage_score("prompt B", GOOD_BRIEFING)  # different prompt → miss
+    assert spy.call_count == 2
+
+
+def test_coverage_denominator_fixed_at_5_when_llm_returns_fewer(mocker, temp_data_dir, monkeypatch):
+    """LLM returns 4 items → coverage uses /5 anyway. Defeats verbosity drift."""
+    operator_sim.reset_cache()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    mocker.patch(
+        "agent.operator_sim.llm.call_with_retry",
+        return_value=_stub_response({
+            "questions": ["q1", "q2", "q3", "q4"],     # only 4 questions
+            "answered": [True, True, True, True],       # all answered
+            "citations": ["[^1]", "[^2]", "[^3]", "[^4]"],  # all cited
+            "coverage": 1.0,                            # LLM claims 4/4
+        }),
+    )
+    out = operator_sim.coverage_score("p", GOOD_BRIEFING)
+    # Grounded = 4, denominator FIXED at EXPECTED_QUESTIONS=5 → 0.8 not 1.0
+    assert out["coverage"] == 0.8
+
+
+def test_coverage_denominator_fixed_at_5_when_llm_returns_more(mocker, temp_data_dir, monkeypatch):
+    """LLM returns 7 items → only first 5 count. Defeats verbosity drift."""
+    operator_sim.reset_cache()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    mocker.patch(
+        "agent.operator_sim.llm.call_with_retry",
+        return_value=_stub_response({
+            "questions": ["q"] * 7,
+            "answered": [True] * 7,
+            "citations": ["[^1]"] * 7,
+            "coverage": 1.0,
+        }),
+    )
+    out = operator_sim.coverage_score("p", GOOD_BRIEFING)
+    # Capped at 5: 5 grounded / 5 = 1.0
+    assert out["coverage"] == 1.0
 
 
 def test_coverage_handles_malformed_json(mocker, temp_data_dir, monkeypatch):
@@ -162,31 +221,5 @@ def test_composite_weights_override():
     assert op_heavy["composite"] > default["composite"]
 
 
-# ---------- classify_composite (verdict thresholds) ----------
-
-def test_classify_promote_on_strong_improvement():
-    decision, reason = operator_sim.classify_composite(baseline_composite=0.5, candidate_composite=0.6)
-    assert decision == "promote"
-    assert "improved" in reason
-
-
-def test_classify_discard_on_strong_regression():
-    decision, reason = operator_sim.classify_composite(baseline_composite=0.7, candidate_composite=0.55)
-    assert decision == "discard"
-    assert "regressed" in reason
-
-
-def test_classify_gate_within_noise_band():
-    decision, _ = operator_sim.classify_composite(baseline_composite=0.5, candidate_composite=0.52)
-    assert decision == "gate"
-
-
-def test_classify_threshold_boundaries():
-    # delta exactly +0.05 → still gate (must exceed)
-    assert operator_sim.classify_composite(0.5, 0.55)[0] == "gate"
-    # delta +0.06 → promote
-    assert operator_sim.classify_composite(0.5, 0.56)[0] == "promote"
-    # delta -0.10 → still gate (must be less than)
-    assert operator_sim.classify_composite(0.5, 0.4)[0] == "gate"
-    # delta -0.11 → discard
-    assert operator_sim.classify_composite(0.5, 0.39)[0] == "discard"
+# classify_composite tests deleted with the function (M-02/AC-6). Verdict
+# logic is exercised through agent.meta_eval.classify_canary in test_meta_eval.
