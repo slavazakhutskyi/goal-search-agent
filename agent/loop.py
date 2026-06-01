@@ -7,6 +7,8 @@ attempted with whatever was fetched.
 """
 
 import json
+import os
+import re
 import time
 from types import ModuleType
 
@@ -45,6 +47,137 @@ TOOL_REGISTRY: dict[str, tuple[dict, ModuleType]] = {
 # GOAL_N applies when the prompt does not parse a numeric goal.
 COMPLETION_SCORE_THRESHOLD = 0.7
 DEFAULT_GOAL_N = 10
+MIN_ITERATION_FOR_JUDGE = 3
+HAIKU_MODEL = "claude-haiku-4-5-20251001"
+
+
+# ---------------------------------------------------------------------------
+# U2 — Goal-completion terminator
+#
+# Two-stage check after every dispatch iteration:
+#
+# 1. Deterministic primary: count candidates with score >= threshold; compare
+#    against goal-N parsed from the prompt via _parse_goal_n. Cheap, predictable.
+# 2. LLM-judge backup: fires only when goal_n cannot be parsed (e.g.,
+#    "find a good restaurant"). Conservative — defaults False on ambiguity.
+#
+# When either fires, a synthetic GOAL_HINT text block is appended to the next
+# user message alongside tool_results. The model sees the hint and (typically)
+# calls finalize() next turn, exiting the loop cleanly.
+# ---------------------------------------------------------------------------
+
+# Goal-N regex: matches "N <some words> <candidate-noun>" anywhere in the
+# prompt. Candidate-nouns are common shapes of search-engine objects across
+# domains. The 1-100 bound rejects accidental matches on years etc.
+_GOAL_N_PATTERN = re.compile(
+    r"\b(\d+)\b\s*(?:\w+\s+){0,4}?"
+    r"(candidates?|companies?|places?|leads?|results?|items?|options?|spots?|"
+    r"pitches?|fields?|jobs?|providers?|vendors?|tools?|articles?|sources?|"
+    r"things?|alternatives?|matches?)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_goal_n(user_prompt: str) -> int | None:
+    """Parse a numeric goal-N from the user's prompt. Return None when no
+    candidate-noun follows a number — caller falls back to LLM-judge.
+    """
+    match = _GOAL_N_PATTERN.search(user_prompt or "")
+    if match:
+        try:
+            n = int(match.group(1))
+        except (ValueError, TypeError):
+            return None
+        if 1 <= n <= 100:
+            return n
+    return None
+
+
+def _deterministic_completion(candidates: list[dict], goal_n: int) -> bool:
+    """True when the count of qualified candidates meets goal_n."""
+    qualified = sum(
+        1 for c in candidates
+        if isinstance(c.get("score"), (int, float)) and c["score"] >= COMPLETION_SCORE_THRESHOLD
+    )
+    return qualified >= goal_n
+
+
+# Process-level cache for the LLM-judge backup. Same (prompt, candidates-count)
+# inside one run should produce the same verdict; no need to re-call Haiku.
+# Cache key truncates the prompt to bound memory.
+_judge_cache: dict[tuple[str, int], bool] = {}
+
+
+def reset_judge_cache() -> None:
+    """Test helper: clear the LLM-judge completion cache between scenarios."""
+    _judge_cache.clear()
+
+
+def _llm_judge_completion(user_prompt: str, candidates: list[dict]) -> bool:
+    """Single Haiku call asking 'is this candidates list enough?'.
+
+    Conservative: defaults False on parse failure, missing API key, or any
+    LLM error. The deterministic check is the primary signal; this only
+    fires when the prompt has no numeric goal-N.
+    """
+    cache_key = ((user_prompt or "")[:200], len(candidates))
+    if cache_key in _judge_cache:
+        return _judge_cache[cache_key]
+
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        _judge_cache[cache_key] = False
+        return False
+
+    summary_lines = []
+    for c in candidates[:20]:
+        name = c.get("name", "?")
+        score = c.get("score", 0)
+        why = (c.get("why_fits") or "")[:100]
+        summary_lines.append(f"- {name} (score {score:.2f}): {why}")
+    summary = "\n".join(summary_lines) if summary_lines else "(no candidates yet)"
+
+    judge_prompt = (
+        f"Goal: {(user_prompt or '')[:500]}\n\n"
+        f"Candidates so far ({len(candidates)}):\n{summary}\n\n"
+        f"Is this list enough to satisfy the goal? Be conservative — answer "
+        f"'yes' only when the list is clearly sufficient in both count and "
+        f"quality. Default 'no' on doubt.\n\n"
+        f'Return STRICT JSON only: {{"decision": "yes"|"no", "reason": "..."}}'
+    )
+
+    try:
+        response = llm.call_with_retry({
+            "model": HAIKU_MODEL,
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": judge_prompt}],
+        })
+    except Exception:
+        _judge_cache[cache_key] = False
+        return False
+
+    text = "".join(b.text for b in response.content if getattr(b, "type", "") == "text").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+    try:
+        parsed = json.loads(text)
+        decision = isinstance(parsed, dict) and (parsed.get("decision") or "").lower() == "yes"
+    except (json.JSONDecodeError, AttributeError, ValueError):
+        decision = False
+
+    _judge_cache[cache_key] = decision
+    return decision
+
+
+def _build_goal_hint(candidates: list[dict]) -> str:
+    """Format the hint text block injected when the terminator says 'done'."""
+    qualified = sum(
+        1 for c in candidates
+        if isinstance(c.get("score"), (int, float)) and c["score"] >= COMPLETION_SCORE_THRESHOLD
+    )
+    return (
+        f"GOAL_HINT: You have {qualified} candidates at score >= "
+        f"{COMPLETION_SCORE_THRESHOLD} (total: {len(candidates)}). The goal "
+        f"appears met. Call finalize() now to emit the ranked list."
+    )
 
 
 def _dispatch_tool(name: str, tool_input: dict) -> dict:
@@ -236,6 +369,22 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
             level = "WARN" if err else "INFO"
             storage.log_event(level, f"tool {tool_use.name}", iteration=iteration, elapsed=tool_elapsed, error=err or "")
             tool_result_blocks.append(_tool_result_block(tool_use.id, result))
+
+        # U2 — Goal-completion terminator. Inject a synthetic GOAL_HINT text
+        # block into the next user message whenever the deterministic check
+        # OR the LLM-judge backup says the goal is met. The model sees the
+        # hint and (typically) calls finalize() next turn.
+        if not finalized and candidates:
+            goal_n = _parse_goal_n(user_prompt)
+            hint_fired = False
+            if goal_n is not None:
+                if _deterministic_completion(candidates, goal_n):
+                    hint_fired = True
+            elif iteration >= MIN_ITERATION_FOR_JUDGE and len(candidates) >= 3:
+                if _llm_judge_completion(user_prompt, candidates):
+                    hint_fired = True
+            if hint_fired:
+                tool_result_blocks.append({"type": "text", "text": _build_goal_hint(candidates)})
 
         messages.append({"role": "user", "content": tool_result_blocks})
 
