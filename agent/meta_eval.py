@@ -687,8 +687,14 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
             },
             ...
           ],
-          "metric_version": "composite-v1",
+          "metric_version": "composite-v1" | "goal-v1",
         }
+
+    metric_version is dispatched at U4 based on detect_output_shape applied
+    to the baseline replay output: "candidates" shape → "goal-v1", otherwise
+    "composite-v1". Consumers should treat the field as one of the two
+    accepted values (evaluate.ACCEPTED_METRIC_VERSIONS) rather than asserting
+    equality with a single constant.
     """
     from agent import evaluate as _eval, replay as _replay, prompts as _prompts_mod
 
@@ -752,11 +758,11 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
         baseline_struct = _eval.check_structure(baseline_brief)
         candidate_struct = _eval.check_structure(candidate_brief)
 
-        # U4 — output-shape dispatch. Detect on baseline; apply the same
+        # Output-shape dispatch. Detect on baseline; apply the same
         # scorer to candidate to keep the verdict apples-to-apples.
         # candidates_list output → goal_coverage_score; briefing → coverage_score.
         baseline_shape = _opsim.detect_output_shape(baseline_brief)
-        if baseline_shape == "candidates":
+        if baseline_shape == _opsim.SHAPE_CANDIDATES:
             baseline_op = _opsim.goal_coverage_score(canary_prompt, baseline_brief)
             candidate_op = _opsim.goal_coverage_score(canary_prompt, candidate_brief)
         else:
@@ -818,16 +824,16 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
     avg_baseline = sum(r["baseline_composite"] for r in k_results) / len(k_results)
     avg_candidate = sum(r["candidate_composite"] for r in k_results) / len(k_results)
 
-    # U4 — pick metric_version based on detected output shape on the last
+    # Pick metric_version based on detected output shape on the last
     # baseline replay. Goal-search runs get "goal-v1"; briefings get
     # "composite-v1". Both flow through the same demonstrations gate
     # (load_few_shot_examples widened to accept both).
     from agent import evaluate as _eval_mod
     last_shape = (
         _opsim.detect_output_shape(baseline_brief)
-        if k_results else "unknown"
+        if k_results else _opsim.SHAPE_UNKNOWN
     )
-    if last_shape == "candidates":
+    if last_shape == _opsim.SHAPE_CANDIDATES:
         metric_version_tag = _eval_mod.GOAL_METRIC_VERSION
     else:
         metric_version_tag = _eval_mod.COMPOSITE_METRIC_VERSION

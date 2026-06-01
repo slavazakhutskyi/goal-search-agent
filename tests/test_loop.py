@@ -607,9 +607,15 @@ def test_system_prompt_within_size_budget():
 # ---------- U6: branding cleanup ----------
 
 def test_no_rapidsos_branding_in_agent_or_readme():
-    """Grep verification: no RapidSOS-specific strings outside docs/."""
+    """Grep verification: no RapidSOS-specific strings outside docs/.
+
+    Resolves repo root from test file location so the test runs portably on
+    CI, forks, and any developer machine — previously hardcoded an absolute
+    path that only worked on the author's laptop (PR#2 review PS-001 fix).
+    """
     import subprocess
-    repo_root = "/Users/slava/Projects/Live/RapidSOS"
+    from pathlib import Path
+    repo_root = str(Path(__file__).resolve().parent.parent)
     result = subprocess.run(
         ["git", "ls-files", "agent/", "README.md"],
         cwd=repo_root, capture_output=True, text=True, check=True,

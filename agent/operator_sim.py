@@ -303,29 +303,40 @@ def reset_cache() -> None:
 
 
 # ============================================================
-# U4 — Goal-coverage metric (for goal-search output shape)
+# Goal-coverage metric (for goal-search output shape)
 # ============================================================
 
-def detect_output_shape(text: str) -> str:
+# Output-shape literals — use these constants in callers rather than string
+# literals to make typos compile-time discoverable and the dispatch surface
+# auditable from grep.
+SHAPE_CANDIDATES = "candidates"
+SHAPE_BRIEFING = "briefing"
+SHAPE_UNKNOWN = "unknown"
+
+from typing import Literal
+
+
+def detect_output_shape(text: str) -> Literal["candidates", "briefing", "unknown"]:
     """Identify the output shape of a briefing/candidates_list markdown.
 
-    Returns one of "candidates", "briefing", "unknown". Used by the canary
-    verdict dispatch in meta_eval.run_canary to pick the right scorer.
-    Heuristic — checks for distinctive section headers rather than parsing.
+    Returns one of SHAPE_CANDIDATES / SHAPE_BRIEFING / SHAPE_UNKNOWN. Used by
+    the canary verdict dispatch in meta_eval.run_canary to pick the right
+    scorer. Heuristic — checks for distinctive section headers rather than
+    parsing.
     """
     if not isinstance(text, str) or not text.strip():
-        return "unknown"
+        return SHAPE_UNKNOWN
     has_candidates_header = "## Candidates" in text
     has_briefing_markers = "## TL;DR" in text or "## Sources" in text
     if has_candidates_header and not has_briefing_markers:
-        return "candidates"
+        return SHAPE_CANDIDATES
     if has_briefing_markers and not has_candidates_header:
-        return "briefing"
+        return SHAPE_BRIEFING
     if has_candidates_header and has_briefing_markers:
         # Both present — unusual but possible if a model emits a hybrid.
         # Prefer briefing (more structured shape).
-        return "briefing"
-    return "unknown"
+        return SHAPE_BRIEFING
+    return SHAPE_UNKNOWN
 
 
 GOAL_COVERAGE_PROMPT = """You are evaluating a goal-completion search agent's output.
@@ -360,10 +371,25 @@ Coverage MUST equal (count of answered=true AND citations non-empty) / 5.
 def goal_coverage_score(prompt: str, candidates_text: str, *, use_llm: bool = True) -> dict:
     """Goal-coverage analog of `coverage_score` for the candidates_list shape.
 
-    Returns the same dict shape as `coverage_score`: {coverage, checks (or
-    questions), answered, citations, cached, error/skip_reason}. Defensive
-    recomputation against EXPECTED_QUESTIONS (5) and groundedness gate
-    (YES needs non-empty citation) — same defenses as coverage_score.
+    Returns a dict with the same FIELDS as `coverage_score` plus one extra
+    field `reported_coverage`:
+
+      {
+        "coverage": float,                # grounded coverage in [0, 1]
+        "questions": list[str],           # the K=5 checks (also under "checks" in the LLM payload)
+        "answered": list[bool],
+        "citations": list[str],
+        "reported_coverage": float|None,  # LLM's self-reported coverage; goal-shape only
+        "tokens": {"input": int, "output": int}|None,
+        "cached": bool,
+        "error": str,                     # present on LLM/parse failure (mutually exclusive with skip_reason)
+        "skip_reason": str,               # present on short text or no-llm mode
+      }
+
+    Defensive recomputation against EXPECTED_QUESTIONS (5) and groundedness
+    gate (YES needs non-empty citation) — same defenses as coverage_score.
+    The extra `reported_coverage` field is what the LLM claimed; the
+    `coverage` field is what we recomputed from grounded answers.
 
     Distinct from coverage_score because the prompt + axes are different:
     candidates have count/diversity/quality dimensions, briefings have

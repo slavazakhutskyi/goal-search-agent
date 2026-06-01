@@ -46,6 +46,32 @@ def test_add_candidate_rejects_negative_score():
     assert "error" in out
 
 
+def test_add_candidate_rejects_nan_score():
+    """NaN passes `< 0 or > 1` silently — any compare with NaN returns False.
+    Reject explicitly so NaN can't poison downstream sort/sum (PR#2 review #13).
+    """
+    out = candidates.add_candidate.run(
+        url="https://a.example", name="A", why_fits="...", score=float("nan"),
+    )
+    assert "error" in out and "finite" in out["error"]
+
+
+def test_add_candidate_rejects_infinite_score():
+    out = candidates.add_candidate.run(
+        url="https://a.example", name="A", why_fits="...", score=float("inf"),
+    )
+    assert "error" in out and "finite" in out["error"]
+
+
+def test_add_candidate_rejects_bool_score():
+    """`True` is an int subclass — passes isinstance(score, (int,float)).
+    Reject explicitly so boolean noise doesn't slip through."""
+    out = candidates.add_candidate.run(
+        url="https://a.example", name="A", why_fits="...", score=True,
+    )
+    assert "error" in out and "number" in out["error"]
+
+
 def test_add_candidate_rejects_missing_required_field():
     out = candidates.add_candidate.run(
         url="https://a.example", name="A", why_fits="", score=0.5

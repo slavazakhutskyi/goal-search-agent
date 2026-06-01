@@ -10,6 +10,7 @@ import json
 import os
 import re
 import time
+from datetime import datetime, timezone
 from types import ModuleType
 
 from agent import evaluate, llm, prompts, storage
@@ -52,7 +53,7 @@ HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
 
 # ---------------------------------------------------------------------------
-# U2 — Goal-completion terminator
+# Goal-completion terminator
 #
 # Two-stage check after every dispatch iteration:
 #
@@ -187,7 +188,6 @@ def _render_candidates_list(user_prompt: str, candidates: list[dict]) -> str:
     )
 
     short_prompt = user_prompt[:80] + ("..." if len(user_prompt) > 80 else "")
-    from datetime import datetime, timezone
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     lines = [
@@ -293,8 +293,8 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
 
     tool_calls: list[dict] = []
     last_summarize_briefing: str | None = None  # set after every successful summarize dispatch
-    candidates: list[dict] = []  # U1 — accumulated by add_candidate dispatch (upsert by URL)
-    finalized: bool = False  # U1 — set by finalize dispatch
+    candidates: list[dict] = []  # accumulated by add_candidate dispatch (upsert by URL)
+    finalized: bool = False  # set by finalize dispatch
     briefing_text = ""
     status = "incomplete"
     llm_error: str | None = None
@@ -372,7 +372,7 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
             tool_elapsed = round(time.time() - tool_started, 2)
             if tool_use.name == "summarize" and isinstance(result, dict) and result.get("briefing"):
                 last_summarize_briefing = result["briefing"]
-            # U1 — state mutation for goal-search tools. add_candidate
+            # State mutation for goal-search tools. add_candidate
             # upserts by URL into loop-local `candidates`; finalize sets the
             # exit flag. The tools themselves are pure validation; mutation
             # happens here so candidates live in the run's local state and
@@ -420,7 +420,7 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
             storage.log_event(level, f"tool {tool_use.name}", iteration=iteration, elapsed=tool_elapsed, error=err or "")
             tool_result_blocks.append(_tool_result_block(tool_use.id, result))
 
-        # U2 — Goal-completion terminator. Inject a synthetic GOAL_HINT text
+        # Goal-completion terminator. Inject a synthetic GOAL_HINT text
         # block into the next user message whenever the deterministic check
         # OR the LLM-judge backup says the goal is met. The model sees the
         # hint and (typically) calls finalize() next turn.
@@ -444,7 +444,7 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
         status = "partial_max_iterations"
 
     if not briefing_text:
-        # U3 — Output-shape dispatch. Priority order:
+        # Output-shape dispatch. Priority order:
         # 1. Candidates list: model called `finalize` OR accumulated ≥3
         #    candidates without finalizing. Renders ranked-list markdown.
         # 2. Briefing: model called `summarize` successfully (AE3 path).

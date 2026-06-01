@@ -12,10 +12,9 @@ local state — the loop's dispatcher reads the tool result and upserts the
 candidate into that list. Keeping the tool functions pure means
 `tests/test_candidates.py` validates schema + validation logic without
 touching the loop.
-
-See docs/plans/2026-06-01-001-feat-goal-search-agent-plan.md U1.
 """
 
+import math
 from typing import Any
 
 
@@ -82,8 +81,12 @@ def add_candidate_run(
         return {"error": "name is required and must be non-empty"}
     if not isinstance(why_fits, str) or not why_fits.strip():
         return {"error": "why_fits is required and must be non-empty"}
-    if not isinstance(score, (int, float)):
+    if not isinstance(score, (int, float)) or isinstance(score, bool):
         return {"error": "score must be a number"}
+    # NaN passes `< 0 or > 1` silently (any comparison with NaN is False) and
+    # poisons downstream sum/sort logic. Reject explicitly. Same for ±inf.
+    if not math.isfinite(float(score)):
+        return {"error": f"score must be a finite number, got {score}"}
     if score < 0 or score > 1:
         return {"error": f"score must be in [0, 1], got {score}"}
 
