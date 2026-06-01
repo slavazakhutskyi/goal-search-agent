@@ -19,7 +19,7 @@ from agent.tools import fetch, search, summarize
 add_candidate = _candidates_mod.add_candidate
 finalize = _candidates_mod.finalize
 
-MAX_ITERATIONS = 12  # Originally 8 from first-principles; observed prompt #1 (RapidSOS 7-day)
+MAX_ITERATIONS = 12  # Originally 8 from first-principles; observed prompt #1 (7-day coverage)
                       # hit the cap with a still-valid briefing via the partial fallback. Raised
                       # to 12 after the U5 iteration-cap measurement step (see plan U4 verification).
                       # Kill switch, not design target.

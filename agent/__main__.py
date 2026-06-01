@@ -18,7 +18,7 @@ def main(argv: list[str] | None = None) -> int:
         args = [a for a in args if a != "--no-eval"]
 
     if not args or not args[0].strip():
-        print('usage: python -m agent [--no-eval] "<prompt>"', file=sys.stderr)
+        print('usage: python -m agent [--no-eval] "<goal>"', file=sys.stderr)
         return 2
 
     prompt = " ".join(args).strip()

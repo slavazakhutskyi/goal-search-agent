@@ -128,7 +128,7 @@ def critique_trace(run_log: dict) -> list[dict]:
 
 # ---------- Layer 3: LLM judge (Haiku) ----------
 
-JUDGE_PROMPT = """You are scoring an intelligence briefing produced by an agent for a RapidSOS operator.
+JUDGE_PROMPT = """You are scoring a briefing produced by a goal-search agent for the user who wrote the prompt.
 
 User prompt: {prompt}
 
@@ -138,7 +138,7 @@ Briefing:
 Return STRICT JSON only (no markdown fence, no commentary):
 {{
   "usefulness": 1-5 integer,
-  "missing": ["up to 3 things a RapidSOS operator would want but the briefing did not cover"],
+  "missing": ["up to 3 things the user would want but the briefing did not cover"],
   "next_run_suggestion": "ONE concrete, actionable suggestion for the agent's next run on a similar prompt. Start with an imperative verb. Max 25 words."
 }}
 """

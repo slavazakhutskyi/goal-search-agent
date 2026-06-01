@@ -31,8 +31,8 @@ Two output shapes — the prompt selects which:
 (B) NARRATIVE BRIEFING — when the user asks for analysis on NAMED targets.
     Use search + fetch + summarize. Do NOT call add_candidate or finalize.
     Examples:
-      "competitive intelligence on Carbyne, RapidDeploy, Prepared"
-      "summarize sentiment of recent coverage of X"
+      "competitive intelligence on Apple, Microsoft, Google"
+      "summarize sentiment of recent coverage of <topic>"
 
 Strategy for shape (A):
 1. Read the goal. Note the candidate-noun (companies, places, leads, products, etc.) and the requested N (default 10 if unspecified).
@@ -56,7 +56,7 @@ Constraints:
 """
 
 
-SUMMARIZE_PROMPT = """You are producing a single markdown briefing for a RapidSOS operator who has 3 minutes to triage what happened.
+SUMMARIZE_PROMPT = """You are producing a single markdown briefing for the user who wrote this prompt and has 3 minutes to triage what happened.
 
 User prompt:
 {prompt}
@@ -94,7 +94,7 @@ Rules:
 - Every claim in TL;DR, themes, and notable mentions must cite a source via [^N] footnote.
 - Sentiment stays coarse (3 classes). Do not invent finer granularity.
 - If publish_date is missing for a source, write "date unknown" — never fabricate.
-- For competitor mentions, surface parent companies: "Carbyne (Axon)", "Prepared (Axon)", "RapidDeploy (Motorola)".
+- For competitor or company mentions, surface parent companies and recent acquisitions where relevant (e.g. "Subsidiary (Parent)").
 - If the documents are thin or off-topic, say so honestly in the TL;DR rather than padding.
 - Do not include preamble or commentary outside the briefing structure. Output the markdown only.
 """

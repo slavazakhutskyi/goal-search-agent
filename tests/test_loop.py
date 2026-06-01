@@ -604,6 +604,37 @@ def test_system_prompt_within_size_budget():
     assert len(prompts.SYSTEM_PROMPT) < 4000
 
 
+# ---------- U6: branding cleanup ----------
+
+def test_no_rapidsos_branding_in_agent_or_readme():
+    """Grep verification: no RapidSOS-specific strings outside docs/."""
+    import subprocess
+    repo_root = "/Users/slava/Projects/Live/RapidSOS"
+    result = subprocess.run(
+        ["git", "ls-files", "agent/", "README.md"],
+        cwd=repo_root, capture_output=True, text=True, check=True,
+    )
+    files = [f for f in result.stdout.strip().split("\n") if f]
+    pattern = r"RapidSOS|Carbyne|RapidDeploy|Prepared|Axon"
+    grep = subprocess.run(
+        ["grep", "-lE", pattern] + files,
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    # grep -l returns 0 when match found; we expect no match (returncode 1)
+    matches = [f for f in grep.stdout.strip().split("\n") if f]
+    assert matches == [], f"Branding leaked into: {matches}"
+
+
+def test_judge_prompt_generalized():
+    from agent import evaluate
+    assert "RapidSOS" not in evaluate.JUDGE_PROMPT
+
+
+def test_operator_sim_prompt_generalized():
+    from agent import operator_sim
+    assert "RapidSOS" not in operator_sim.OPERATOR_SIM_PROMPT
+
+
 def test_ae3_backward_compat_briefing_path_unchanged(
     mocker, mock_llm_queue, temp_data_dir
 ):

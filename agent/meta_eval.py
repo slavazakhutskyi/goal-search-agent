@@ -173,7 +173,7 @@ def _partition_edit_history(history: list[dict]) -> dict:
     return out
 
 
-META_EVAL_PROMPT = """You are auditing the SYSTEM_PROMPT of an intelligence-briefing agent for RapidSOS. Your job is to propose CONCRETE, ANCHORED edits to that SYSTEM_PROMPT based on observed run failures.
+META_EVAL_PROMPT = """You are auditing the SYSTEM_PROMPT of a goal-completion search agent. Your job is to propose CONCRETE, ANCHORED edits to that SYSTEM_PROMPT based on observed run failures.
 
 # Current SYSTEM_PROMPT
 

@@ -2,8 +2,9 @@
 
 Two public functions:
 
-- `coverage_score(prompt, briefing)`: one Haiku call. Simulates a RapidSOS
-  operator reading the briefing in 3 minutes and asking 5 follow-up questions.
+- `coverage_score(prompt, briefing)`: one Haiku call. Simulates the user who
+  wrote the prompt reading the briefing in 3 minutes and asking 5 follow-up
+  questions.
   Each YES answer must cite a `[^N]` footnote in the briefing — the
   groundedness check defeats the LLM-judge generosity bias adversarial
   flagged. Coverage = (answered AND grounded) / total.
@@ -62,7 +63,7 @@ EXPECTED_QUESTIONS = 5
 _coverage_cache: dict[str, dict] = {}
 
 
-OPERATOR_SIM_PROMPT = """You are a RapidSOS operator who has 3 minutes to triage <briefing>.
+OPERATOR_SIM_PROMPT = """You are the user who wrote this prompt and has 3 minutes to triage the briefing below.
 
 User prompt:
 {prompt}
