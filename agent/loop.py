@@ -11,7 +11,11 @@ import time
 from types import ModuleType
 
 from agent import evaluate, llm, prompts, storage
+from agent.tools import candidates as _candidates_mod
 from agent.tools import fetch, search, summarize
+
+add_candidate = _candidates_mod.add_candidate
+finalize = _candidates_mod.finalize
 
 MAX_ITERATIONS = 12  # Originally 8 from first-principles; observed prompt #1 (RapidSOS 7-day)
                       # hit the cap with a still-valid briefing via the partial fallback. Raised
@@ -27,7 +31,20 @@ TOOL_REGISTRY: dict[str, tuple[dict, ModuleType]] = {
     "search": (search.TOOL_SCHEMA, search),
     "fetch": (fetch.TOOL_SCHEMA, fetch),
     "summarize": (summarize.TOOL_SCHEMA, summarize),
+    # Goal-search tools (U1). Loop dispatch upserts candidates into local
+    # state when add_candidate fires with ok=True; sets finalized flag when
+    # finalize fires. See _state_mutate_from_tool below.
+    "add_candidate": (add_candidate.TOOL_SCHEMA, add_candidate),
+    "finalize": (finalize.TOOL_SCHEMA, finalize),
 }
+
+
+# Score threshold and goal-N defaults for the terminator (U2). Imported by
+# tests to assert against. COMPLETION_SCORE_THRESHOLD is the bar a candidate
+# must clear to count toward the deterministic completion check. Default
+# GOAL_N applies when the prompt does not parse a numeric goal.
+COMPLETION_SCORE_THRESHOLD = 0.7
+DEFAULT_GOAL_N = 10
 
 
 def _dispatch_tool(name: str, tool_input: dict) -> dict:
@@ -97,6 +114,8 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
 
     tool_calls: list[dict] = []
     last_summarize_briefing: str | None = None  # set after every successful summarize dispatch
+    candidates: list[dict] = []  # U1 — accumulated by add_candidate dispatch (upsert by URL)
+    finalized: bool = False  # U1 — set by finalize dispatch
     briefing_text = ""
     status = "incomplete"
     llm_error: str | None = None
@@ -170,6 +189,32 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
             tool_elapsed = round(time.time() - tool_started, 2)
             if tool_use.name == "summarize" and isinstance(result, dict) and result.get("briefing"):
                 last_summarize_briefing = result["briefing"]
+            # U1 — state mutation for goal-search tools. add_candidate
+            # upserts by URL into loop-local `candidates`; finalize sets the
+            # exit flag. The tools themselves are pure validation; mutation
+            # happens here so candidates live in the run's local state and
+            # don't leak across runs.
+            if (
+                tool_use.name == "add_candidate"
+                and isinstance(result, dict)
+                and result.get("ok")
+                and isinstance(result.get("candidate"), dict)
+            ):
+                cand = result["candidate"]
+                cand_url = cand.get("url", "")
+                # Upsert by URL: replace existing if same URL, else append.
+                for i, existing in enumerate(candidates):
+                    if existing.get("url") == cand_url:
+                        candidates[i] = cand
+                        break
+                else:
+                    candidates.append(cand)
+            if (
+                tool_use.name == "finalize"
+                and isinstance(result, dict)
+                and result.get("finalized")
+            ):
+                finalized = True
             err = result.get("error") if isinstance(result, dict) else None
             # Record the as-dispatched input (post auto-attach). For summarize
             # auto-attach we collapse the docs to a count so the log stays
