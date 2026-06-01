@@ -12,8 +12,9 @@ from agent import llm, prompts
 TOOL_SCHEMA = {
     "name": "summarize",
     "description": (
-        "Produce the final markdown briefing from the list of fetched documents. "
-        "Call this exactly once, after gathering 4-8 sources via search and fetch. "
+        "Produce the final markdown briefing. Call this exactly once after fetching sources. "
+        "The `documents` argument is OPTIONAL — if omitted, the loop will automatically attach "
+        "all documents you successfully fetched this run. Passing them explicitly is also fine. "
         "Returns the briefing as a markdown string — return it verbatim to the user."
     ),
     "input_schema": {
@@ -25,7 +26,10 @@ TOOL_SCHEMA = {
             },
             "documents": {
                 "type": "array",
-                "description": "List of fetched documents (with text + metadata).",
+                "description": (
+                    "OPTIONAL list of fetched documents. If omitted, the loop attaches "
+                    "all successfully fetched docs from this run automatically."
+                ),
                 "items": {
                     "type": "object",
                     "properties": {
@@ -36,7 +40,7 @@ TOOL_SCHEMA = {
                 },
             },
         },
-        "required": ["prompt", "documents"],
+        "required": ["prompt"],
     },
 }
 
@@ -58,8 +62,15 @@ def _format_documents(documents: list[dict]) -> str:
     return "\n\n".join(chunks)
 
 
-def run(prompt: str, documents: list[dict]) -> dict:
-    """Returns {'briefing': <markdown string>}. Empty docs → stub no-sources briefing."""
+def run(prompt: str, documents: list[dict] | None = None) -> dict:
+    """Returns {'briefing': <markdown string>}.
+
+    `documents` defaults to None (treated as empty list). The agent loop
+    auto-attaches all successfully-fetched docs from the current run when the
+    model omits this arg — see loop._collect_fetched_docs. Eliminates the
+    summarize_missing_documents trace pattern that fired across most runs.
+    """
+    documents = documents or []
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     if not documents:

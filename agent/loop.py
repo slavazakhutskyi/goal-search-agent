@@ -10,7 +10,7 @@ import json
 import time
 from types import ModuleType
 
-from agent import llm, prompts, storage
+from agent import evaluate, llm, prompts, storage
 from agent.tools import fetch, search, summarize
 
 MAX_ITERATIONS = 12  # Originally 8 from first-principles; observed prompt #1 (RapidSOS 7-day)
@@ -43,6 +43,27 @@ def _dispatch_tool(name: str, tool_input: dict) -> dict:
         return {"error": f"{name} raised: {exc!r}"}
 
 
+def _collect_fetched_docs(tool_calls: list[dict]) -> list[dict]:
+    """Read cached docs for every successful fetch in the current run.
+
+    Auto-attach helper for the summarize-without-documents path (U0 from
+    docs/plans/2026-05-27-002...). Mirrors the existing fallback pattern at
+    the bottom of `run()` so both paths use the same definition of
+    "successfully fetched" — has text, no error.
+    """
+    docs: list[dict] = []
+    for call in tool_calls:
+        if call.get("name") != "fetch":
+            continue
+        url = (call.get("input") or {}).get("url", "")
+        if not url:
+            continue
+        cached = storage.load_fetched(url)
+        if cached and cached.get("text") and not cached.get("error"):
+            docs.append(cached)
+    return docs
+
+
 def _tool_result_block(tool_use_id: str, content: dict) -> dict:
     """Serialize tool output for the next assistant turn."""
     return {
@@ -52,11 +73,27 @@ def _tool_result_block(tool_use_id: str, content: dict) -> dict:
     }
 
 
-def run(user_prompt: str) -> dict:
-    """Run the agent end-to-end on one user prompt. Returns briefing + trace."""
+def run(user_prompt: str, *, self_eval: bool = True) -> dict:
+    """Run the agent end-to-end on one user prompt. Returns briefing + trace.
+
+    `self_eval=True` (default) runs a self-critique pass after the briefing is
+    saved and appends one line to data/logs/evals.jsonl. The next run reads
+    those lessons and appends them to SYSTEM_PROMPT — that is the compounding
+    feedback loop. Tests pass `self_eval=False` to keep runs deterministic.
+    """
     started = time.time()
     tools = [schema for schema, _ in TOOL_REGISTRY.values()]
     messages: list[dict] = [{"role": "user", "content": user_prompt}]
+
+    # Compounding loop: append few-shot demonstrations to SYSTEM_PROMPT.
+    # demonstrations_block returns "" until ≥3 composite-v1 edit_history
+    # records exist (metric_version gate per U3 — prevents teaching the old
+    # saturated-metric biases via demonstrations from pre-composite runs).
+    # Until then SYSTEM_PROMPT is unchanged from the static base.
+    system_prompt = prompts.SYSTEM_PROMPT
+    if self_eval:
+        demo_block = evaluate.demonstrations_block()
+        system_prompt = system_prompt + demo_block
 
     tool_calls: list[dict] = []
     last_summarize_briefing: str | None = None  # set after every successful summarize dispatch
@@ -75,7 +112,7 @@ def run(user_prompt: str) -> dict:
                 "model": llm.SONNET_MODEL,
                 "max_tokens": MAX_TOKENS,
                 "tools": tools,
-                "system": prompts.SYSTEM_PROMPT,
+                "system": system_prompt,
                 "messages": messages,
             })
         except Exception as exc:
@@ -116,15 +153,38 @@ def run(user_prompt: str) -> dict:
         tool_result_blocks = []
         for tool_use in tool_uses:
             tool_started = time.time()
-            result = _dispatch_tool(tool_use.name, dict(tool_use.input))
+            tool_input = dict(tool_use.input)
+            # U0 auto-attach: if the model called summarize without documents,
+            # inject all successfully-fetched docs from this run before dispatch.
+            # Eliminates the summarize_missing_documents failure pattern that
+            # fired in 6 of 7 historical runs.
+            #
+            # Use `not tool_input.get("documents")` (truthiness) rather than
+            # `"documents" not in tool_input` (key presence): the model can
+            # legitimately omit the key, pass `documents=None`, or pass an
+            # empty list. All three should trigger auto-attach; only the
+            # key-omission case is caught by the presence check.
+            if tool_use.name == "summarize" and not tool_input.get("documents"):
+                tool_input["documents"] = _collect_fetched_docs(tool_calls)
+            result = _dispatch_tool(tool_use.name, tool_input)
             tool_elapsed = round(time.time() - tool_started, 2)
             if tool_use.name == "summarize" and isinstance(result, dict) and result.get("briefing"):
                 last_summarize_briefing = result["briefing"]
             err = result.get("error") if isinstance(result, dict) else None
+            # Record the as-dispatched input (post auto-attach). For summarize
+            # auto-attach we collapse the docs to a count so the log stays
+            # compact and the URL list isn't duplicated from fetch records.
+            recorded_input = dict(tool_use.input)
+            if (
+                tool_use.name == "summarize"
+                and not tool_use.input.get("documents")
+                and tool_input.get("documents")
+            ):
+                recorded_input["_auto_attached_docs"] = len(tool_input["documents"])
             tool_calls.append({
                 "iteration": iteration,
                 "name": tool_use.name,
-                "input": dict(tool_use.input),
+                "input": recorded_input,
                 "elapsed_seconds": tool_elapsed,
                 "error": err,
             })
@@ -201,6 +261,20 @@ def run(user_prompt: str) -> dict:
         tools=len(tool_calls),
     )
 
+    # Self-evaluation pass. Wrapped — eval failure must never break the run.
+    eval_record: dict | None = None
+    if self_eval:
+        try:
+            eval_record = evaluate.run_self_eval(log_entry, briefing_text)
+            evaluate.save_eval(eval_record)
+            storage.log_event(
+                "INFO", "self-eval done",
+                score=eval_record["structure"]["score"],
+                issues=len(eval_record["trace_issues"]),
+            )
+        except Exception as exc:
+            storage.log_event("WARN", "self-eval failed", error=f"{type(exc).__name__}: {exc}")
+
     return {
         "briefing": briefing_text,
         "briefing_path": briefing_path,
@@ -209,4 +283,5 @@ def run(user_prompt: str) -> dict:
         "elapsed_seconds": round(elapsed, 2),
         "tool_call_count": len(tool_calls),
         "tokens": {"input": total_input_tokens, "output": total_output_tokens},
+        "eval": eval_record,
     }

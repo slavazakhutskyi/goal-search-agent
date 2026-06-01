@@ -62,4 +62,4 @@ def test_cli_joins_multiple_args(capsys, mocker):
 
     cli.main(["Give", "me", "a", "briefing"])
 
-    spy.assert_called_once_with("Give me a briefing")
+    spy.assert_called_once_with("Give me a briefing", self_eval=True)
