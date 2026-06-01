@@ -99,7 +99,7 @@ def test_propose_parses_clean_json_and_validates_anchors(temp_data_dir, mocker, 
         "patterns_observed": [{"tag": "T", "count": 1, "trend": "new", "interpretation": "..."}],
         "prior_attempts_considered": [],
         "proposed_edits": [
-            {"id": "E1", "type": "add", "anchor": "Strategy:", "new_text": "...", "rationale": "...", "addresses_pattern_tag": "T"}
+            {"id": "E1", "type": "add", "anchor": "Constraints:", "new_text": "...", "rationale": "...", "addresses_pattern_tag": "T"}
         ],
     }
     import types
@@ -109,7 +109,7 @@ def test_propose_parses_clean_json_and_validates_anchors(temp_data_dir, mocker, 
     result = meta_eval.propose_edits(use_llm=True)
     assert len(result["proposed_edits"]) == 1
     edit = result["proposed_edits"][0]
-    # The real SYSTEM_PROMPT contains "Strategy:" once → valid
+    # The real SYSTEM_PROMPT contains "Constraints:" once → valid
     assert edit["anchor_count"] == 1
     assert edit["anchor_valid"] is True
 
@@ -228,7 +228,7 @@ def test_apply_edit_dry_run_does_not_mutate(temp_data_dir, mocker, monkeypatch):
     meta = {
         "timestamp": "x",
         "proposed_edits": [
-            {"id": "E1", "type": "add", "anchor": "Strategy:", "new_text": "- Cite every claim.",
+            {"id": "E1", "type": "add", "anchor": "Constraints:", "new_text": "- Cite every claim.",
              "rationale": "r", "anchor_valid": True, "anchor_count": 1},
         ],
     }
@@ -249,7 +249,7 @@ def test_apply_edit_with_yes_mutates_and_opens_record(temp_data_dir, mocker):
     meta = {
         "timestamp": "x",
         "proposed_edits": [
-            {"id": "E1", "type": "add", "anchor": "Strategy:", "new_text": "- Cite every claim.",
+            {"id": "E1", "type": "add", "anchor": "Constraints:", "new_text": "- Cite every claim.",
              "rationale": "r", "anchor_valid": True, "anchor_count": 1},
         ],
     }
@@ -309,7 +309,7 @@ def test_revert_last_edit_restores_file_and_flips_kept(temp_data_dir, mocker):
     fake_path = _fake_prompts_py(temp_data_dir)
     mocker.patch("agent.meta_eval._prompts_py_path", return_value=fake_path)
     meta = {"timestamp": "x", "proposed_edits": [
-        {"id": "E1", "type": "add", "anchor": "Strategy:", "new_text": "- New rule.",
+        {"id": "E1", "type": "add", "anchor": "Constraints:", "new_text": "- New rule.",
          "rationale": "r", "anchor_valid": True, "anchor_count": 1},
     ]}
     meta_eval._save_meta_eval(meta)
@@ -328,7 +328,7 @@ def test_revert_refuses_when_kept_already_set(temp_data_dir, mocker):
     fake_path = _fake_prompts_py(temp_data_dir)
     mocker.patch("agent.meta_eval._prompts_py_path", return_value=fake_path)
     meta = {"timestamp": "x", "proposed_edits": [
-        {"id": "E1", "type": "add", "anchor": "Strategy:", "new_text": "- X.",
+        {"id": "E1", "type": "add", "anchor": "Constraints:", "new_text": "- X.",
          "anchor_valid": True, "anchor_count": 1},
     ]}
     meta_eval._save_meta_eval(meta)
@@ -343,7 +343,7 @@ def test_keep_last_edit_marks_kept_true(temp_data_dir, mocker):
     fake_path = _fake_prompts_py(temp_data_dir)
     mocker.patch("agent.meta_eval._prompts_py_path", return_value=fake_path)
     meta = {"timestamp": "x", "proposed_edits": [
-        {"id": "E1", "type": "add", "anchor": "Strategy:", "new_text": "- X.",
+        {"id": "E1", "type": "add", "anchor": "Constraints:", "new_text": "- X.",
          "anchor_valid": True, "anchor_count": 1},
     ]}
     meta_eval._save_meta_eval(meta)
@@ -449,7 +449,7 @@ def test_run_canary_promote_path(temp_data_dir, mocker):
     # Also need agent.prompts.SYSTEM_PROMPT for the canary baseline — let it be the live module
     from agent import prompts as live_prompts
     # Edit must apply cleanly to live SYSTEM_PROMPT for the test
-    edit = {"id": "E1", "type": "add", "anchor": "Strategy:", "new_text": "- Cite every claim.",
+    edit = {"id": "E1", "type": "add", "anchor": "Constraints:", "new_text": "- Cite every claim.",
             "anchor_valid": True, "anchor_count": 1}
 
     # Mock replay.replay_run to return predictable briefings
@@ -478,7 +478,7 @@ def test_run_canary_discard_on_delete(temp_data_dir, mocker):
     """type=delete short-circuits to discard regardless of canary."""
     fake_path = _fake_prompts_py(temp_data_dir)
     mocker.patch("agent.meta_eval._prompts_py_path", return_value=fake_path)
-    edit = {"id": "E2", "type": "delete", "anchor": "Strategy:",
+    edit = {"id": "E2", "type": "delete", "anchor": "Constraints:",
             "anchor_valid": True, "anchor_count": 1}
     # replay should NOT be called
     spy = mocker.patch("agent.replay.replay_run")
@@ -491,7 +491,7 @@ def test_run_canary_discard_on_delete(temp_data_dir, mocker):
 def test_run_canary_gate_when_no_canary_prompt(temp_data_dir, mocker):
     fake_path = _fake_prompts_py(temp_data_dir)
     mocker.patch("agent.meta_eval._prompts_py_path", return_value=fake_path)
-    edit = {"id": "E3", "type": "add", "anchor": "Strategy:", "new_text": "...",
+    edit = {"id": "E3", "type": "add", "anchor": "Constraints:", "new_text": "...",
             "anchor_valid": True, "anchor_count": 1}
     # No canary_prompt + no runs.jsonl → can't select → gate
     result = meta_eval.run_canary(edit, k=1)
@@ -507,7 +507,7 @@ def _stub_proposal_with_one_edit():
         "patterns_observed": [{"tag": "T", "count": 1, "trend": "new", "interpretation": "..."}],
         "prior_attempts_considered": [],
         "proposed_edits": [
-            {"id": "E1", "type": "add", "anchor": "Strategy:", "new_text": "- New rule.",
+            {"id": "E1", "type": "add", "anchor": "Constraints:", "new_text": "- New rule.",
              "rationale": "r", "addresses_pattern_tag": "T",
              "anchor_valid": True, "anchor_count": 1},
         ],
@@ -614,7 +614,7 @@ def test_autonomous_anchor_reproposal_guard(temp_data_dir, mocker):
     mocker.patch("agent.meta_eval._prompts_py_path", return_value=fake_path)
     # Pre-seed edit_history with a discarded anchor matching our proposed edit
     meta_eval.record_edit_attempt({
-        "anchor": "Strategy:", "verdict": "canary_discarded", "kept": False,
+        "anchor": "Constraints:", "verdict": "canary_discarded", "kept": False,
     })
     mocker.patch("agent.meta_eval.propose_edits", return_value=_stub_proposal_with_one_edit())
     # run_canary should NOT be called — guard catches reproposal first

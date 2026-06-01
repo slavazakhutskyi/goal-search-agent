@@ -568,6 +568,42 @@ def test_post_loop_dispatch_emits_candidates_floor_at_3(
     assert "## Candidates" in out["briefing"]
 
 
+# ---------- U5: SYSTEM_PROMPT shape ----------
+
+def test_system_prompt_documents_new_tools():
+    from agent import prompts
+    assert "add_candidate" in prompts.SYSTEM_PROMPT
+    assert "finalize" in prompts.SYSTEM_PROMPT
+    assert "summarize" in prompts.SYSTEM_PROMPT
+    # Search/fetch still documented
+    assert "search(" in prompts.SYSTEM_PROMPT
+    assert "fetch(" in prompts.SYSTEM_PROMPT
+
+
+def test_system_prompt_describes_both_output_shapes():
+    from agent import prompts
+    text = prompts.SYSTEM_PROMPT
+    # Shape A reference
+    assert "CANDIDATES LIST" in text or "candidates list" in text.lower()
+    # Shape B reference
+    assert "NARRATIVE BRIEFING" in text or "briefing" in text.lower()
+
+
+def test_system_prompt_removes_rapidsos_branding():
+    from agent import prompts
+    text = prompts.SYSTEM_PROMPT
+    assert "RapidSOS" not in text
+    # Parent-company hardcoded rule for specific competitors is gone
+    assert "Axon owns Carbyne" not in text
+    assert "Motorola owns RapidDeploy" not in text
+
+
+def test_system_prompt_within_size_budget():
+    from agent import prompts
+    # Soft cap — agent context is large but new prompt shouldn't bloat
+    assert len(prompts.SYSTEM_PROMPT) < 4000
+
+
 def test_ae3_backward_compat_briefing_path_unchanged(
     mocker, mock_llm_queue, temp_data_dir
 ):
