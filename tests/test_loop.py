@@ -470,3 +470,131 @@ def test_build_goal_hint_includes_counts():
     assert "2" in hint  # 2 qualified
     assert "3" in hint  # 3 total
     assert "finalize()" in hint
+
+
+# ---------- U3: output-shape dispatch ----------
+
+def test_render_candidates_list_sorted_by_score_desc():
+    from agent import loop
+    cands = [
+        {"url": "u1", "name": "Mid", "why_fits": "m", "score": 0.7},
+        {"url": "u2", "name": "Top", "why_fits": "t", "score": 0.95},
+        {"url": "u3", "name": "Low", "why_fits": "l", "score": 0.4},
+    ]
+    out = loop._render_candidates_list("find 3 things", cands)
+    # Top score first
+    top_idx = out.find("**Top**")
+    mid_idx = out.find("**Mid**")
+    low_idx = out.find("**Low**")
+    assert 0 < top_idx < mid_idx < low_idx
+
+
+def test_render_candidates_list_has_required_markdown_sections():
+    from agent import loop
+    out = loop._render_candidates_list("test", [
+        {"url": "u", "name": "A", "why_fits": "ok", "score": 0.8},
+    ])
+    assert out.startswith("# Goal — ")
+    assert "## Candidates" in out
+    assert "**A**" in out
+    assert "(u)" in out
+    assert "score 0.80" in out
+
+
+def test_render_candidates_list_handles_axes_when_present():
+    from agent import loop
+    out = loop._render_candidates_list("x", [{
+        "url": "u", "name": "A", "why_fits": "ok", "score": 0.8,
+        "axes": {"timezone": 0.9, "skill": 0.7},
+    }])
+    assert "axes" in out
+    assert "timezone=0.90" in out
+
+
+def test_render_candidates_list_omits_axes_section_when_empty():
+    from agent import loop
+    out = loop._render_candidates_list("x", [{
+        "url": "u", "name": "A", "why_fits": "ok", "score": 0.8,
+    }])
+    assert "axes:" not in out
+
+
+def test_post_loop_dispatch_emits_candidates_list_when_finalized(
+    mocker, mock_llm_queue, temp_data_dir
+):
+    """finalize=True → candidates_list output, not briefing."""
+    from agent import loop
+    from .conftest import make_response, make_text_block, make_tool_use_block
+    loop.reset_judge_cache()
+
+    mock_llm_queue.extend([
+        make_response([
+            make_tool_use_block("t1", "add_candidate", {
+                "url": "https://a.example", "name": "A", "why_fits": "...", "score": 0.9,
+            }),
+            make_tool_use_block("t2", "finalize", {}),
+        ]),
+        make_response([make_text_block("done")]),
+    ])
+    out = loop.run("find 1 candidate", self_eval=False)
+    assert "## Candidates" in out["briefing"]
+    assert "**A**" in out["briefing"]
+
+
+def test_post_loop_dispatch_emits_candidates_floor_at_3(
+    mocker, mock_llm_queue, temp_data_dir
+):
+    """≥3 candidates, no finalize → still emit candidates_list (floor)."""
+    from agent import loop
+    from .conftest import make_response, make_text_block, make_tool_use_block
+    loop.reset_judge_cache()
+
+    mock_llm_queue.extend([
+        make_response([
+            make_tool_use_block("t1", "add_candidate", {
+                "url": "u1", "name": "A", "why_fits": "...", "score": 0.8,
+            }),
+            make_tool_use_block("t2", "add_candidate", {
+                "url": "u2", "name": "B", "why_fits": "...", "score": 0.7,
+            }),
+            make_tool_use_block("t3", "add_candidate", {
+                "url": "u3", "name": "C", "why_fits": "...", "score": 0.6,
+            }),
+        ]),
+        make_response([make_text_block("done without finalize")]),
+    ])
+    out = loop.run("x", self_eval=False)
+    # 3 candidates without finalize still triggers candidates_list (floor)
+    assert "## Candidates" in out["briefing"]
+
+
+def test_ae3_backward_compat_briefing_path_unchanged(
+    mocker, mock_llm_queue, temp_data_dir
+):
+    """AE3 critical regression test: a run that calls search + fetch +
+    summarize (no add_candidate) emits a BRIEFING, not candidates_list."""
+    from agent import loop
+    from .conftest import make_response, make_text_block, make_tool_use_block
+
+    CANNED_BRIEFING = (
+        "# Briefing — competitive intelligence\n\n"
+        "## TL;DR\nThings happened.\n\n"
+        "## Key themes\n- A [^1]\n\n"
+        "## Sentiment\n**Neutral** — ok.\n\n"
+        "## Sources\n[^1]: [A](https://a.example)\n"
+    )
+    mocker.patch("agent.tools.search.run", return_value={"query": "x", "results": []})
+    mocker.patch("agent.tools.summarize.run", return_value={"briefing": CANNED_BRIEFING})
+
+    mock_llm_queue.extend([
+        make_response([make_tool_use_block("t1", "search", {"query": "x"})]),
+        make_response([make_tool_use_block("t2", "summarize", {"prompt": "test", "documents": []})]),
+        make_response([make_text_block("done")]),
+    ])
+
+    out = loop.run("competitive intelligence on Carbyne, RapidDeploy, Prepared", self_eval=False)
+
+    # AE3 must produce the SUMMARIZE briefing, NOT candidates_list
+    assert out["briefing"] == CANNED_BRIEFING
+    assert "## Candidates" not in out["briefing"]
+    assert "# Briefing —" in out["briefing"]

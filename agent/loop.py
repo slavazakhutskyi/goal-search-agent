@@ -167,6 +167,52 @@ def _llm_judge_completion(user_prompt: str, candidates: list[dict]) -> bool:
     return decision
 
 
+def _render_candidates_list(user_prompt: str, candidates: list[dict]) -> str:
+    """Markdown rendering for U3 — candidates_list output shape.
+
+    Sorted by score descending, ties broken by name. Empty axes are omitted
+    from the bullet to keep noise low. Falls back to a stub when candidates
+    is empty (should be caller-guarded but defensive).
+    """
+    if not candidates:
+        return (
+            f"# Goal — {user_prompt[:80]}\n\n"
+            f"*0 candidates · no candidates were added during the run.*\n"
+        )
+
+    # Stable sort: score desc, then name asc for deterministic output.
+    ranked = sorted(
+        candidates,
+        key=lambda c: (-(c.get("score") or 0), (c.get("name") or "").lower()),
+    )
+
+    short_prompt = user_prompt[:80] + ("..." if len(user_prompt) > 80 else "")
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    lines = [
+        f"# Goal — {short_prompt}",
+        f"*Generated {ts} · {len(ranked)} candidates · sorted by score desc*",
+        "",
+        "## Candidates",
+        "",
+    ]
+    for i, cand in enumerate(ranked, start=1):
+        name = cand.get("name", "?")
+        url = cand.get("url", "")
+        score = cand.get("score", 0)
+        why = cand.get("why_fits", "")
+        axes = cand.get("axes") or {}
+        lines.append(f"{i}. **{name}** ({url}) — score {score:.2f}")
+        if why:
+            lines.append(f"   {why}")
+        if axes:
+            axes_str = " · ".join(f"{k}={v:.2f}" for k, v in axes.items())
+            lines.append(f"   *axes:* {axes_str}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _build_goal_hint(candidates: list[dict]) -> str:
     """Format the hint text block injected when the terminator says 'done'."""
     qualified = sum(
@@ -287,13 +333,17 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
         text_blocks = [b.text for b in response.content if b.type == "text"]
 
         if not tool_uses:
-            # Final text turn. Prefer the most recent successful summarize result;
-            # fall back to the model's inline text if no summarize ever ran.
-            if last_summarize_briefing:
+            # Final text turn. Priority order (U3):
+            # 1. Candidates list if model finalized OR ≥3 candidates accumulated.
+            # 2. Last successful summarize briefing (AE3 path).
+            # 3. Inline model text as a last resort.
+            if finalized or len(candidates) >= 3:
+                briefing_text = _render_candidates_list(user_prompt, candidates)
+            elif last_summarize_briefing:
                 briefing_text = last_summarize_briefing
             elif text_blocks:
                 briefing_text = "\n".join(text_blocks).strip()
-            # If both empty, we leave briefing_text="" and fall into the partial branch
+            # If all empty, leave briefing_text="" and fall into the partial branch
             # rather than persisting an empty briefing as "complete".
             if briefing_text:
                 status = "complete"
@@ -394,8 +444,18 @@ def run(user_prompt: str, *, self_eval: bool = True) -> dict:
         status = "partial_max_iterations"
 
     if not briefing_text:
+        # U3 — Output-shape dispatch. Priority order:
+        # 1. Candidates list: model called `finalize` OR accumulated ≥3
+        #    candidates without finalizing. Renders ranked-list markdown.
+        # 2. Briefing: model called `summarize` successfully (AE3 path).
+        # 3. Existing fallback (last text, error stub, summarize-from-fetched).
+        # The candidates floor (≥3) makes a partial run with real candidates
+        # still useful; AE3 prompts never trigger it because they don't call
+        # add_candidate.
+        if (finalized or len(candidates) >= 3) and not llm_error:
+            briefing_text = _render_candidates_list(user_prompt, candidates)
         # Reuse a successful summarize if the model called it before hitting cap/error.
-        if last_summarize_briefing:
+        elif last_summarize_briefing:
             briefing_text = last_summarize_briefing
         elif llm_error:
             # LLM is already broken — skip the fallback summarize call (it would
