@@ -748,13 +748,20 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
         baseline_brief = baseline_run.get("briefing", "")
         candidate_brief = candidate_run.get("briefing", "")
 
-        # Structure (existing)
+        # Structure (existing — used for both shapes; cheap to compute always)
         baseline_struct = _eval.check_structure(baseline_brief)
         candidate_struct = _eval.check_structure(candidate_brief)
 
-        # Operator simulation (new — primary signal, with groundedness check)
-        baseline_op = _opsim.coverage_score(canary_prompt, baseline_brief)
-        candidate_op = _opsim.coverage_score(canary_prompt, candidate_brief)
+        # U4 — output-shape dispatch. Detect on baseline; apply the same
+        # scorer to candidate to keep the verdict apples-to-apples.
+        # candidates_list output → goal_coverage_score; briefing → coverage_score.
+        baseline_shape = _opsim.detect_output_shape(baseline_brief)
+        if baseline_shape == "candidates":
+            baseline_op = _opsim.goal_coverage_score(canary_prompt, baseline_brief)
+            candidate_op = _opsim.goal_coverage_score(canary_prompt, candidate_brief)
+        else:
+            baseline_op = _opsim.coverage_score(canary_prompt, baseline_brief)
+            candidate_op = _opsim.coverage_score(canary_prompt, candidate_brief)
 
         # Trace issues from each replay run. Fixes the dead-code bug flagged
         # by 5 reviewers: the previous expression `[... for c in (x and [] or [])]`
@@ -811,6 +818,20 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
     avg_baseline = sum(r["baseline_composite"] for r in k_results) / len(k_results)
     avg_candidate = sum(r["candidate_composite"] for r in k_results) / len(k_results)
 
+    # U4 — pick metric_version based on detected output shape on the last
+    # baseline replay. Goal-search runs get "goal-v1"; briefings get
+    # "composite-v1". Both flow through the same demonstrations gate
+    # (load_few_shot_examples widened to accept both).
+    from agent import evaluate as _eval_mod
+    last_shape = (
+        _opsim.detect_output_shape(baseline_brief)
+        if k_results else "unknown"
+    )
+    if last_shape == "candidates":
+        metric_version_tag = _eval_mod.GOAL_METRIC_VERSION
+    else:
+        metric_version_tag = _eval_mod.COMPOSITE_METRIC_VERSION
+
     result = {
         "edit_id": edit.get("id"),
         "edit_type": edit.get("type"),
@@ -821,7 +842,7 @@ def run_canary(edit: dict, *, k: int = 1, canary_prompt: str | None = None,
         "candidate_composite": round(avg_candidate, 4),
         "k": k,
         "k_results": k_results,
-        "metric_version": _metric_version(),  # marks this record for U3 demonstrations gate
+        "metric_version": metric_version_tag,
     }
     _save_canary(result)
     return result

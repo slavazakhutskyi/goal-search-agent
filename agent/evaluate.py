@@ -252,6 +252,8 @@ def lessons_block(lessons: list[str]) -> str:
 # Records without this field (or with structure-v0) are excluded from
 # demonstrations to prevent teaching old-metric biases.
 COMPOSITE_METRIC_VERSION = "composite-v1"
+GOAL_METRIC_VERSION = "goal-v1"  # U4 — tag for goal-search output runs
+ACCEPTED_METRIC_VERSIONS = (COMPOSITE_METRIC_VERSION, GOAL_METRIC_VERSION)
 MIN_COMPOSITE_RECORDS = 3
 MAX_DEMO_BRIEFING_CHARS = 200
 MAX_TIMESTAMP_WINDOW_HOURS = 24
@@ -343,7 +345,7 @@ def load_few_shot_examples(
 
     # Filter to composite-scored records only
     composite_edits = [
-        e for e in edits if e.get("metric_version") == COMPOSITE_METRIC_VERSION
+        e for e in edits if e.get("metric_version") in ACCEPTED_METRIC_VERSIONS
     ]
     n = len(composite_edits)
 

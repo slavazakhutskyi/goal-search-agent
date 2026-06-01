@@ -299,3 +299,179 @@ def composite_score(eval_record: dict, weights: dict | None = None) -> dict:
 def reset_cache() -> None:
     """Test helper: clear the coverage cache between scenarios."""
     _coverage_cache.clear()
+
+
+# ============================================================
+# U4 — Goal-coverage metric (for goal-search output shape)
+# ============================================================
+
+def detect_output_shape(text: str) -> str:
+    """Identify the output shape of a briefing/candidates_list markdown.
+
+    Returns one of "candidates", "briefing", "unknown". Used by the canary
+    verdict dispatch in meta_eval.run_canary to pick the right scorer.
+    Heuristic — checks for distinctive section headers rather than parsing.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "unknown"
+    has_candidates_header = "## Candidates" in text
+    has_briefing_markers = "## TL;DR" in text or "## Sources" in text
+    if has_candidates_header and not has_briefing_markers:
+        return "candidates"
+    if has_briefing_markers and not has_candidates_header:
+        return "briefing"
+    if has_candidates_header and has_briefing_markers:
+        # Both present — unusual but possible if a model emits a hybrid.
+        # Prefer briefing (more structured shape).
+        return "briefing"
+    return "unknown"
+
+
+GOAL_COVERAGE_PROMPT = """You are evaluating a goal-completion search agent's output.
+
+User prompt (the goal):
+{prompt}
+
+Candidates list the agent produced:
+{candidates_text}
+
+Step 1: List 5 yes/no checks for whether this list satisfies the goal.
+        Cover: count vs requested N, diversity of candidates, quality of
+        why_fits explanations, score distribution, alignment with criteria.
+Step 2: For each check, answer YES/NO. Be strict — answer YES only when
+        the list clearly passes the check.
+Step 3: For each YES, cite a specific candidate name or score from the list
+        as evidence. If you cannot cite, change the answer to NO.
+
+Return STRICT JSON only (no markdown fence):
+
+{{
+  "checks": ["...", "...", "...", "...", "..."],
+  "answered": [true, false, true, true, false],
+  "citations": ["Acme score 0.9", "", "WidgetCo", "names diverse", ""],
+  "coverage": 0.6
+}}
+
+Coverage MUST equal (count of answered=true AND citations non-empty) / 5.
+"""
+
+
+def goal_coverage_score(prompt: str, candidates_text: str, *, use_llm: bool = True) -> dict:
+    """Goal-coverage analog of `coverage_score` for the candidates_list shape.
+
+    Returns the same dict shape as `coverage_score`: {coverage, checks (or
+    questions), answered, citations, cached, error/skip_reason}. Defensive
+    recomputation against EXPECTED_QUESTIONS (5) and groundedness gate
+    (YES needs non-empty citation) — same defenses as coverage_score.
+
+    Distinct from coverage_score because the prompt + axes are different:
+    candidates have count/diversity/quality dimensions, briefings have
+    operator-utility dimensions.
+    """
+    if not candidates_text or len(candidates_text) < MIN_BRIEFING_LEN:
+        return {
+            "coverage": 0.0,
+            "questions": [],
+            "answered": [],
+            "citations": [],
+            "cached": False,
+            "skip_reason": "candidates text too short",
+        }
+
+    cache_key = _cache_key(f"GOAL:{prompt}", candidates_text)
+    if cache_key in _coverage_cache:
+        cached = dict(_coverage_cache[cache_key])
+        cached["cached"] = True
+        return cached
+
+    if not use_llm or not os.environ.get("ANTHROPIC_API_KEY"):
+        return {
+            "coverage": 0.0,
+            "questions": [],
+            "answered": [],
+            "citations": [],
+            "cached": False,
+            "skip_reason": "no_llm_mode",
+        }
+
+    user_message = GOAL_COVERAGE_PROMPT.format(
+        prompt=prompt[:500],
+        candidates_text=candidates_text[:8000],
+    )
+
+    try:
+        response = llm.call_with_retry({
+            "model": HAIKU_MODEL,
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": user_message}],
+        })
+    except (RuntimeError, ValueError) as exc:
+        return {
+            "coverage": 0.0,
+            "questions": [],
+            "answered": [],
+            "citations": [],
+            "cached": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    except Exception as exc:  # pragma: no cover
+        return {
+            "coverage": 0.0,
+            "questions": [],
+            "answered": [],
+            "citations": [],
+            "cached": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    text = "".join(b.text for b in response.content if getattr(b, "type", "") == "text").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.MULTILINE).strip()
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return {
+            "coverage": 0.0,
+            "questions": [],
+            "answered": [],
+            "citations": [],
+            "cached": False,
+            "error": f"non-JSON response: {exc}",
+        }
+
+    # Same groundedness gate as coverage_score: YES counts only when citation
+    # is non-empty AND denominator is FIXED at EXPECTED_QUESTIONS.
+    answered = parsed.get("answered") or []
+    citations = parsed.get("citations") or []
+    grounded = sum(
+        1
+        for i in range(min(len(answered), len(citations), EXPECTED_QUESTIONS))
+        if answered[i] and (citations[i] or "").strip()
+    )
+    coverage = grounded / EXPECTED_QUESTIONS
+
+    usage = getattr(response, "usage", None)
+    tokens = None
+    if usage is not None:
+        tokens = {
+            "input": getattr(usage, "input_tokens", 0),
+            "output": getattr(usage, "output_tokens", 0),
+        }
+
+    result = {
+        "coverage": round(coverage, 4),
+        "questions": parsed.get("checks") or parsed.get("questions") or [],
+        "answered": answered,
+        "citations": citations,
+        "reported_coverage": parsed.get("coverage"),
+        "tokens": tokens,
+        "cached": False,
+    }
+    if len(_coverage_cache) >= MAX_CACHE_SIZE:
+        try:
+            oldest = next(iter(_coverage_cache))
+            del _coverage_cache[oldest]
+        except StopIteration:
+            pass
+    _coverage_cache[cache_key] = result
+    return result

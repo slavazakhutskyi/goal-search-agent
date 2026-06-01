@@ -223,3 +223,97 @@ def test_composite_weights_override():
 
 # classify_composite tests deleted with the function (M-02/AC-6). Verdict
 # logic is exercised through agent.meta_eval.classify_canary in test_meta_eval.
+
+
+# ---------- U4: output-shape detection ----------
+
+CANDIDATES_MARKDOWN = (
+    "# Goal — find 10 things\n"
+    "*Generated x · 10 candidates · sorted by score desc*\n\n"
+    "## Candidates\n\n"
+    "1. **Acme** (https://a.example) — score 0.90\n"
+    "   matches X requirement\n"
+)
+
+BRIEFING_MARKDOWN = (
+    "# Briefing — competitive intel\n\n"
+    "## TL;DR\nThings.\n\n"
+    "## Key themes\n- A [^1]\n\n"
+    "## Sentiment\n**Neutral** — ok.\n\n"
+    "## Sources\n[^1]: [A](https://a.example)\n"
+)
+
+
+def test_detect_output_shape_candidates():
+    assert operator_sim.detect_output_shape(CANDIDATES_MARKDOWN) == "candidates"
+
+
+def test_detect_output_shape_briefing():
+    assert operator_sim.detect_output_shape(BRIEFING_MARKDOWN) == "briefing"
+
+
+def test_detect_output_shape_unknown_when_empty():
+    assert operator_sim.detect_output_shape("") == "unknown"
+    assert operator_sim.detect_output_shape(None) == "unknown"
+    assert operator_sim.detect_output_shape("plain text") == "unknown"
+
+
+def test_detect_output_shape_hybrid_prefers_briefing():
+    """If both markers present (unusual), prefer briefing (more structured)."""
+    hybrid = CANDIDATES_MARKDOWN + "\n" + BRIEFING_MARKDOWN
+    assert operator_sim.detect_output_shape(hybrid) == "briefing"
+
+
+# ---------- U4: goal_coverage_score ----------
+
+def test_goal_coverage_skips_short_text(temp_data_dir):
+    operator_sim.reset_cache()
+    out = operator_sim.goal_coverage_score("find 10 things", "short")
+    assert out["coverage"] == 0.0
+    assert out["skip_reason"] == "candidates text too short"
+
+
+def test_goal_coverage_no_llm_mode(temp_data_dir, monkeypatch):
+    operator_sim.reset_cache()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    out = operator_sim.goal_coverage_score("find 10 things", CANDIDATES_MARKDOWN)
+    assert out["coverage"] == 0.0
+    assert out["skip_reason"] == "no_llm_mode"
+
+
+def test_goal_coverage_groundedness_gate(mocker, temp_data_dir, monkeypatch):
+    """YES without citation → not counted."""
+    operator_sim.reset_cache()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    mocker.patch(
+        "agent.operator_sim.llm.call_with_retry",
+        return_value=_stub_response({
+            "checks": ["c1", "c2", "c3", "c4", "c5"],
+            "answered": [True, True, True, True, True],
+            "citations": ["Acme", "", "", "", ""],  # only 1 grounded
+            "coverage": 1.0,
+        }),
+    )
+    out = operator_sim.goal_coverage_score("find 10 things", CANDIDATES_MARKDOWN)
+    assert out["coverage"] == 0.2  # grounded 1/5, not LLM-claimed 1.0
+
+
+def test_goal_coverage_distinguishes_from_coverage_score_via_cache(
+    mocker, temp_data_dir, monkeypatch
+):
+    """Same prompt+text should produce different cache keys for the two scorers."""
+    operator_sim.reset_cache()
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    response = _stub_response({
+        "questions": ["q"] * 5,
+        "checks": ["c"] * 5,
+        "answered": [True] * 5,
+        "citations": ["x"] * 5,
+        "coverage": 1.0,
+    })
+    spy = mocker.patch("agent.operator_sim.llm.call_with_retry", return_value=response)
+    # Both calls use same prompt + text but different scorers → both should
+    # hit LLM (different cache keys due to GOAL: prefix).
+    operator_sim.coverage_score("p", CANDIDATES_MARKDOWN)
+    operator_sim.goal_coverage_score("p", CANDIDATES_MARKDOWN)
+    assert spy.call_count == 2
