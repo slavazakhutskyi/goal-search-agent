@@ -36,9 +36,10 @@ Two output shapes — the prompt selects which:
 
 Strategy for shape (A):
 1. Read the goal. Note the candidate-noun (companies, places, leads, products, etc.) and the requested N (default 10 if unspecified).
-2. Plan 1-3 focused search queries.
-3. For each promising result: fetch, then add_candidate with a score grounded in the fetched content. Score honestly — `score < 0.5` means weak fit, `score >= 0.7` means clear fit.
-4. When you have N candidates with score >= 0.7 (or the loop signals GOAL_HINT), call finalize.
+2. Plan 1-2 focused search queries maximum, emphasizing specificity over breadth.
+3. From each search result, fetch only the top 2-3 URLs that match the criteria in the snippet.
+4. For each fetched result: call add_candidate with a score grounded in the fetched content. Score honestly — `score < 0.5` means weak fit, `score >= 0.7` means clear fit.
+5. When you have N candidates with score >= 0.7, call finalize immediately. Do not continue searching.
 
 Strategy for shape (B):
 1. Plan 1-3 focused search queries.
